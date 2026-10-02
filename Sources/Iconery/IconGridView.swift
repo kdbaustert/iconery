@@ -18,7 +18,8 @@ struct IconGridView: View {
             ) {
                 ForEach(icons) { icon in
                     IconCell(
-                        icon: icon, size: cellSize, isSelected: library.selection.contains(icon.id)
+                        icon: icon, size: cellSize, labels: library.preferences.labels,
+                        isSelected: library.selection.contains(icon.id)
                     )
                     .onTapGesture {
                         isFocused = true
@@ -40,7 +41,7 @@ struct IconGridView: View {
         .focusEffectDisabled()
         .onKeyPress(.delete) {
             guard !library.selection.isEmpty else { return .ignored }
-            library.pendingDeletion = .icons(library.selection)
+            library.requestDeleteIcons(library.selection)
             return .handled
         }
         .overlay { emptyState(showing: icons) }
@@ -160,7 +161,9 @@ struct IconTile: View {
 private struct IconCell: View {
     let icon: Icon
     let size: Double
+    let labels: LabelMode
     let isSelected: Bool
+    @State private var isHovered = false
 
     var body: some View {
         VStack(spacing: 5) {
@@ -180,20 +183,26 @@ private struct IconCell: View {
                             .padding(5)
                     }
                 }
-            Text(icon.name)
-                .font(.caption)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
-                .foregroundStyle(isSelected ? .white : .primary)
-                .background(
-                    isSelected ? Color.accentColor : .clear,
-                    in: RoundedRectangle(cornerRadius: 4)
-                )
+            if labels != .never {
+                Text(icon.name)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .foregroundStyle(isSelected ? .white : .primary)
+                    .background(
+                        isSelected ? Color.accentColor : .clear,
+                        in: RoundedRectangle(cornerRadius: 4)
+                    )
+                    // On Hover keeps the label's space, so the grid doesn't shift under the
+                    // pointer.
+                    .opacity(labels == .always || isHovered || isSelected ? 1 : 0)
+            }
         }
         .frame(width: size + 36)
         .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
     }
 }
 
@@ -215,6 +224,9 @@ private struct IconMenu: View {
             library.exportSelection()
         }
         Divider()
-        Button("Delete…", role: .destructive) { library.pendingDeletion = .icons(targets) }
+        let asks = library.preferences.confirmsIconDeletion
+        Button(asks ? "Delete…" : "Delete", role: .destructive) {
+            library.requestDeleteIcons(targets)
+        }
     }
 }

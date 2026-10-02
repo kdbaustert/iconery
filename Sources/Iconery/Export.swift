@@ -59,6 +59,8 @@ struct ExportOptions: Codable, Equatable {
     /// When set, Export and drags write every output of this preset instead of the format and
     /// sizes above; the fill, background and quality still apply.
     var presetID: String?
+    var naming = ExportNaming.iconName
+    var svgCleanup = SVGCleanup()
 
     static let pngChoices = [16, 24, 32, 48, 64, 96, 128, 256, 512, 1024]
     /// An ICO entry stores each side in one byte, so 256 is the largest size the format holds.
@@ -134,6 +136,9 @@ extension ExportOptions {
             ?? fallback.includeSize
         quality = try saved.decodeIfPresent(Double.self, forKey: .quality) ?? fallback.quality
         presetID = try saved.decodeIfPresent(String.self, forKey: .presetID)
+        naming = (try? saved.decodeIfPresent(ExportNaming.self, forKey: .naming)) ?? fallback.naming
+        svgCleanup = try saved.decodeIfPresent(SVGCleanup.self, forKey: .svgCleanup)
+            ?? fallback.svgCleanup
     }
 
     /// The settings for each output of `preset`, keeping this export's fill, background and
@@ -262,6 +267,103 @@ struct ExportPreset: Identifiable, Codable, Hashable {
     }
 }
 
+/// IconJar's file naming preferences.
+enum ExportNaming: String, Codable, CaseIterable, Identifiable {
+    case iconName, originalFileName, tags
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .iconName: "Icon name"
+        case .originalFileName: "Original file name"
+        case .tags: "Tags"
+        }
+    }
+}
+
+/// IconJar's simpler SVG export options. Its dozen path-optimising ones are left out.
+struct SVGCleanup: Codable, Equatable {
+    var removesSize = false
+    var removesComments = false
+    var removesDeclaration = false
+    var compresses = false
+
+    var changesAnything: Bool { removesSize || removesComments || removesDeclaration || compresses }
+}
+
+/// Edits SVG text in place rather than parsing and re-serialising it, so everything not asked for
+/// stays byte for byte as it was.
+enum SVGCleaner {
+    static func clean(_ svg: String, _ options: SVGCleanup) -> String {
+        var svg = svg
+        if options.removesDeclaration {
+            svg = svg.replacing(#/^\s*<\?xml[^>]*\?>\s*/#, with: "")
+        }
+        if options.removesComments {
+            svg = svg.replacing(#/<!--[\s\S]*?-->/#, with: "")
+        }
+        if options.removesSize { svg = withoutSize(svg) }
+        if options.compresses {
+            svg = svg.replacing(#/>\s+</#, with: "><")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return svg
+    }
+
+    /// Drops width and height from the root <svg>, so it scales to whatever holds it. A file with
+    /// no viewBox gets one from them first, or the drawing would lose its proportions; when they
+    /// aren't plain numbers it is left alone.
+    private static func withoutSize(_ svg: String) -> String {
+        guard let root = svg.firstMatch(of: #/<svg\b[^>]*>/#) else { return svg }
+        var tag = String(root.output)
+        if attribute("viewBox", in: tag) == nil {
+            guard let width = attribute("width", in: tag).flatMap(number),
+                  let height = attribute("height", in: tag).flatMap(number)
+            else { return svg }
+            let box = String(format: "0 0 %g %g", width, height)
+            tag = tag.replacing(#/^<svg\b/#, with: "<svg viewBox=\"\(box)\"")
+        }
+        // A space before the name, so stroke-width and the like are never touched.
+        tag = tag.replacing(#/\s(?:width|height)\s*=\s*(?:"[^"]*"|'[^']*')/#, with: "")
+        return svg.replacingCharacters(in: root.range, with: tag)
+    }
+
+    private static func attribute(_ name: String, in tag: String) -> String? {
+        guard let pattern = try? Regex("\\s\(name)\\s*=\\s*[\"']([^\"']*)[\"']"),
+              let match = tag.firstMatch(of: pattern),
+              let value = match.output[1].substring
+        else { return nil }
+        return String(value)
+    }
+
+    /// "24" or "24px"; nil for "100%", "2em" and the like, which say nothing about proportions.
+    private static func number(_ value: String) -> Double? {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        return Double(trimmed.hasSuffix("px") ? String(trimmed.dropLast(2)) : trimmed)
+    }
+
+    /// The <title> and <desc> an SVG names itself with, which IconJar reads into the icon's name
+    /// and description on import.
+    static func titleAndDescription(of svg: String) -> (title: String?, description: String?) {
+        func text(_ element: String) -> String? {
+            guard let pattern = try? Regex("<\(element)\\b[^>]*>([\\s\\S]*?)</\(element)>"),
+                  let match = svg.firstMatch(of: pattern),
+                  let value = match.output[1].substring
+            else { return nil }
+            let decoded = String(value)
+                .replacingOccurrences(of: "&lt;", with: "<")
+                .replacingOccurrences(of: "&gt;", with: ">")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .replacingOccurrences(of: "&apos;", with: "'")
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return decoded.isEmpty ? nil : decoded
+        }
+        return (text("title"), text("desc"))
+    }
+}
+
 struct ExportFile {
     var name: String
     var data: Data
@@ -287,7 +389,12 @@ enum Exporter {
     /// The names exporting `icon` writes, before anything is drawn: prefix, name and suffix, then
     /// the size when asked for or when several sizes would otherwise share one name.
     static func fileNames(for icon: Icon, options: ExportOptions) -> [String] {
-        let base = safeFileName(options.prefix + icon.name + options.suffix)
+        let stem = switch options.naming {
+        case .iconName: icon.name
+        case .originalFileName: icon.originalName ?? icon.name
+        case .tags: icon.tags.isEmpty ? icon.name : icon.tags.joined(separator: "-")
+        }
+        let base = safeFileName(options.prefix + stem + options.suffix)
         let ext = options.format.rawValue
         switch options.format {
         // An icon that isn't an SVG has no vector version, so it goes out as the file it came in
@@ -307,7 +414,13 @@ enum Exporter {
         let names = fileNames(for: icon, options: options)
         let format = options.format
         if format == .svg || format == .original {
-            return [ExportFile(name: names[0], data: try Data(contentsOf: source))]
+            var data = try Data(contentsOf: source)
+            if format == .svg, icon.kind == .svg, options.svgCleanup.changesAnything {
+                let text = String(decoding: data, as: UTF8.self)
+                let cleaned = SVGCleaner.clean(text, options.svgCleanup)
+                data = Data(cleaned.utf8)
+            }
+            return [ExportFile(name: names[0], data: data)]
         }
         let sizes = switch format {
         case .ico: options.sizes.filter { $0 <= 256 }

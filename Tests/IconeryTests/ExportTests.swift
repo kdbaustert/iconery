@@ -1,6 +1,7 @@
 import AppKit
 import ImageIO
 import SQLite3
+import UniformTypeIdentifiers
 import XCTest
 @testable import Iconery
 
@@ -94,6 +95,32 @@ final class ExportTests: XCTestCase {
                        "exports keep the icon's own colour")
     }
 
+    /// Preferences held in memory only, so a test never touches the real ones or leaves a file.
+    @MainActor
+    private func preferences(_ change: (Preferences) -> Void = { _ in }) -> Preferences {
+        let preferences = Preferences(defaults: nil)
+        change(preferences)
+        return preferences
+    }
+
+    @MainActor
+    private func writePNG(_ name: String) throws -> URL {
+        let source = try writeSVG("\(name)-source", #"<rect width="10" height="10" fill="black"/>"#)
+        let image = try XCTUnwrap(NSImage(contentsOf: source))
+        let png = try XCTUnwrap(Raster.render(image, pixels: 32).flatMap {
+            Raster.encode($0, as: .png)
+        })
+        let url = folder.appending(path: "\(name).png")
+        try png.write(to: url)
+        return url
+    }
+
+    /// `source` with a comment added, so it draws the same but is a different file.
+    private func distinctCopy(of source: URL, marked mark: String, to destination: URL) throws {
+        let svg = try String(contentsOf: source, encoding: .utf8)
+        try Data((svg + "<!-- \(mark) -->").utf8).write(to: destination)
+    }
+
     private func writeSVG(_ name: String, _ body: String) throws -> URL {
         let svg = #"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">"#
             + body + "</svg>"
@@ -142,20 +169,23 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
-    func testBackUpWritesDatedZipsOutsideTheLibrary() throws {
+    func testBackUpWritesDatedZipsOutsideTheLibrary() async throws {
         let library = Library(folder: folder.appending(path: "Library"))
         library.createSet(named: "Set")
         let backups = folder.appending(path: "Backups")
 
-        let first = try library.backUp(into: backups)
-        let second = try library.backUp(into: backups)
+        let first = try await library.backUp(into: backups)
+        let second = try await library.backUp(into: backups)
 
         XCTAssertTrue(first.lastPathComponent.hasPrefix("Iconery Backup "))
         XCTAssertEqual(first.pathExtension, "zip")
         XCTAssertNotEqual(first, second, "two backups in the same second don't overwrite")
         XCTAssertNotNil(library.lastBackup)
         let inside = library.folder.appending(path: "Backups")
-        XCTAssertThrowsError(try library.backUp(into: inside))
+        do {
+            try await library.backUp(into: inside)
+            XCTFail("a backup was written inside the library it backs up")
+        } catch {}
         XCTAssertThrowsError(try library.changeBackupFolder(to: inside))
     }
 
@@ -282,7 +312,9 @@ final class ExportTests: XCTestCase {
             try FileManager.default.createDirectory(
                 at: directory, withIntermediateDirectories: true
             )
-            try FileManager.default.copyItem(at: source, to: directory.appending(path: file))
+            // Each a different icon, as real ones are; identical files would be skipped as
+            // duplicates.
+            try distinctCopy(of: source, marked: file, to: directory.appending(path: file))
         }
         try FileManager.default.createDirectory(
             at: lucide.appending(path: "Empty"), withIntermediateDirectories: true
@@ -310,7 +342,9 @@ final class ExportTests: XCTestCase {
         let inner = library.createSet(named: "Inner", inside: outer.id)
         let other = library.createSet(named: "Other")
         library.importItems([source], into: inner.id)
-        library.importItems([source], into: other.id)
+        let another = folder.appending(path: "another.svg")
+        try distinctCopy(of: source, marked: "another", to: another)
+        library.importItems([another], into: other.id)
 
         library.perform(.set(outer, iconCount: 1, setCount: 1))
 
@@ -510,6 +544,235 @@ final class ExportTests: XCTestCase {
         XCTAssertTrue(ExportPreset.loadSaved().isEmpty)
     }
 
+    func testSearchMatchesEveryWordAcrossTheChosenFields() {
+        var icon = Icon(name: "arrow-left", setID: UUID(), kind: .svg)
+        icon.tags = ["navigation"]
+        icon.info = "Points back"
+        func finds(_ query: String, _ scope: SearchScope = SearchScope()) -> Bool {
+            iconMatches(icon, query: query, setPath: "Lucide › Outline", scope: scope)
+        }
+        XCTAssertTrue(finds("row"), "anywhere in a word")
+        XCTAssertTrue(finds("ARROW nav"), "every word, in any searched field, in any case")
+        XCTAssertFalse(finds("arrow right"), "every word has to match")
+        XCTAssertFalse(finds("lucide"), "set names are off by default")
+        XCTAssertTrue(finds("lucide", SearchScope(setNames: true)), "the whole set path counts")
+        XCTAssertFalse(finds("navigation", SearchScope(tags: false)))
+        XCTAssertTrue(finds("back", SearchScope(descriptions: true)))
+        XCTAssertTrue(finds("   "))
+    }
+
+    @MainActor
+    func testGridSortsByNameTypeOrDate() throws {
+        let preferences = preferences()
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)
+        let set = library.createSet(named: "Set")
+        // Imported b, then a, then c, so Date Added (newest first) reads c, a, b.
+        library.importItems([try writePNG("b")], into: set.id)
+        library.importItems([try writeSVG("a", #"<path d="M1 1h4"/>"#)], into: set.id)
+        library.importItems([try writeSVG("c", #"<path d="M2 2h4"/>"#)], into: set.id)
+        func order() -> [String] { library.icons(in: .set(set.id)).map(\.name) }
+
+        XCTAssertEqual(order(), ["a", "b", "c"])
+        preferences.sort = .fileType
+        XCTAssertEqual(order(), ["b", "a", "c"], "PNG before SVG, then by name")
+        preferences.sort = .dateAdded
+        XCTAssertEqual(order(), ["c", "a", "b"])
+    }
+
+    @MainActor
+    func testRecentlyUsedKeepsAsManyAsSettingsSay() throws {
+        let preferences = preferences { $0.recentLimit = 25 }
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)
+        let files = try (0..<30).map { try writeSVG("icon\($0)", #"<path d="M\#($0) 1h4"/>"#) }
+        library.importItems(files, into: library.createSet(named: "Set").id)
+        library.update(Set(library.icons.map(\.id))) { $0.lastUsed = .now }
+        XCTAssertEqual(library.count(in: .recent), 25)
+        XCTAssertEqual(library.icons(in: .recent).count, 25)
+    }
+
+    @MainActor
+    func testDuplicatesAreLeftOutByContent() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let set = library.createSet(named: "Set")
+        let original = try writeSVG("house", #"<path d="M3 10l9-7 9 7"/>"#)
+        let renamed = folder.appending(path: "renamed.svg")
+        try FileManager.default.copyItem(at: original, to: renamed)
+        library.importItems([original], into: set.id)
+        let report = library.importItems([renamed], into: set.id)
+        XCTAssertEqual(report.duplicates, 1, "a renamed copy is the same file")
+        XCTAssertEqual(library.icons.count, 1)
+
+        let copies = folder.appending(path: "Copies")
+        try FileManager.default.createDirectory(at: copies, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: original, to: copies.appending(path: "x.svg"))
+        XCTAssertEqual(library.importItems([copies], into: nil).duplicates, 1)
+        XCTAssertEqual(library.sets.map(\.name), ["Set"], "no empty set left behind")
+
+        let allowing = Library(
+            folder: folder.appending(path: "Other"),
+            preferences: preferences { $0.skipsDuplicates = false }
+        )
+        allowing.importItems([original, renamed], into: allowing.createSet(named: "Set").id)
+        XCTAssertEqual(allowing.icons.count, 2)
+    }
+
+    @MainActor
+    func testAnSVGsTitleNamesTheIcon() throws {
+        let titled = try writeSVG(
+            "file-name", #"<title>Home &amp; Garden</title><desc>A house</desc><path d="M1 1h9"/>"#
+        )
+        let sketch = try writeSVG(
+            "sketch", #"<title>bell</title><desc>Created with Sketch.</desc><path d="M2 2h9"/>"#
+        )
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        library.importItems([titled, sketch], into: library.createSet(named: "Set").id)
+        let home = try XCTUnwrap(library.icons.first { $0.originalName == "file-name" })
+        XCTAssertEqual(home.name, "Home & Garden")
+        XCTAssertEqual(home.info, "A house")
+        let bell = try XCTUnwrap(library.icons.first { $0.originalName == "sketch" })
+        XCTAssertEqual(bell.name, "bell")
+        XCTAssertNil(bell.info, "an editor's “Created with” line describes nothing")
+
+        let plain = Library(
+            folder: folder.appending(path: "Plain"),
+            preferences: preferences { $0.readsSVGTitles = false }
+        )
+        plain.importItems([titled], into: plain.createSet(named: "Set").id)
+        XCTAssertEqual(plain.icons.first?.name, "file-name")
+    }
+
+    @MainActor
+    func testLooseFilesGoWhereSettingsSay() throws {
+        let preferences = preferences()
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)
+        let inbox = library.createSet(named: "Inbox")
+        preferences.looseFilesSetID = inbox.id
+        library.importItems([try writeSVG("loose", #"<path d="M1 1h9"/>"#)], into: nil)
+        XCTAssertEqual(library.icons.first?.setID, inbox.id)
+        XCTAssertFalse(library.sets.contains { $0.name == "Unsorted" })
+    }
+
+    @MainActor
+    func testDeletingAsksOnlyWhenSettingsSay() throws {
+        let preferences = preferences { $0.confirmsIconDeletion = false }
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)
+        let set = library.createSet(named: "Set")
+        library.importItems([try writeSVG("one", #"<path d="M1 1h9"/>"#)], into: set.id)
+        library.requestDeleteIcons(Set(library.icons.map(\.id)))
+        XCTAssertTrue(library.icons.isEmpty)
+        XCTAssertNil(library.pendingDeletion)
+
+        preferences.confirmsIconDeletion = true
+        library.importItems([try writeSVG("two", #"<path d="M2 2h9"/>"#)], into: set.id)
+        library.requestDeleteIcons(Set(library.icons.map(\.id)))
+        XCTAssertEqual(library.icons.count, 1, "waits for the answer")
+        XCTAssertNotNil(library.pendingDeletion)
+    }
+
+    func testSVGCleanupChangesOnlyWhatIsAskedFor() {
+        let svg = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!-- Generator: Example -->
+        <svg xmlns="http://www.w3.org/2000/svg" width="24px" height="24">
+          <path stroke-width="2" d="M1 1h9"/>
+        </svg>
+        """
+        XCTAssertEqual(SVGCleaner.clean(svg, SVGCleanup()), svg, "nothing asked, nothing changed")
+        let everything = SVGCleanup(
+            removesSize: true, removesComments: true, removesDeclaration: true, compresses: true
+        )
+        XCTAssertEqual(
+            SVGCleaner.clean(svg, everything),
+            #"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">"#
+                + #"<path stroke-width="2" d="M1 1h9"/></svg>"#,
+            "a viewBox from the size it replaces; stroke-width untouched"
+        )
+        let sizeOnly = SVGCleanup(removesSize: true)
+        let boxed = #"<svg viewBox="0 0 16 16" width="16" height="16"/>"#
+        XCTAssertEqual(SVGCleaner.clean(boxed, sizeOnly), #"<svg viewBox="0 0 16 16"/>"#)
+        let fluid = #"<svg width="100%" height="100%"><path d="M1 1"/></svg>"#
+        XCTAssertEqual(SVGCleaner.clean(fluid, sizeOnly), fluid,
+                       "no viewBox and no numbers to make one from, so it is left alone")
+    }
+
+    func testExportNamesFollowTheNamingSetting() {
+        var icon = Icon(name: "Home", setID: UUID(), kind: .svg)
+        icon.originalName = "ic_home_24"
+        icon.tags = ["house", "building"]
+        var options = ExportOptions()
+        options.pngSizes = [32]
+        options.naming = .originalFileName
+        XCTAssertEqual(Exporter.fileNames(for: icon, options: options), ["ic_home_24.png"])
+        options.naming = .tags
+        XCTAssertEqual(Exporter.fileNames(for: icon, options: options), ["house-building.png"])
+        icon.tags = []
+        icon.originalName = nil
+        XCTAssertEqual(Exporter.fileNames(for: icon, options: options), ["Home.png"])
+        options.naming = .originalFileName
+        XCTAssertEqual(Exporter.fileNames(for: icon, options: options), ["Home.png"],
+                       "icons from before original names were kept use their name")
+    }
+
+    @MainActor
+    func testExportCanKeepSetFoldersAndAddFinderTags() throws {
+        let preferences = preferences {
+            $0.keepsSetFolders = true
+            $0.addsFinderTags = true
+        }
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)
+        library.export = ExportOptions()
+        let outer = library.createSet(named: "Outer")
+        let inner = library.createSet(named: "Inner", inside: outer.id)
+        let (_, source) = try makeSVGIcon()
+        library.importItems([source], into: inner.id)
+        let icon = try XCTUnwrap(library.icons.first)
+        library.setTags(icon.id, ["house"])
+
+        let result = library.export(library.icons, to: folder.appending(path: "Out"))
+        XCTAssertEqual(result.problems, [])
+        let file = try XCTUnwrap(result.written.first)
+        XCTAssertEqual(file.pathComponents.suffix(4), ["Out", "Outer", "Inner", "home.png"])
+        XCTAssertEqual(try file.resourceValues(forKeys: [.tagNamesKey]).tagNames, ["house"])
+    }
+
+    func testOnlyTheNewestBackupsAreKept() throws {
+        let backups = folder.appending(path: "Backups")
+        try FileManager.default.createDirectory(at: backups, withIntermediateDirectories: true)
+        for name in [
+            "Iconery Backup 2026-09-02 at 10.00.00.zip",
+            "Iconery Backup 2026-09-01 at 10.00.00.zip",
+            "Iconery Backup 2026-09-03 at 10.00.00.zip",
+            "Notes.zip", "Iconery Backup.txt",
+        ] {
+            try Data().write(to: backups.appending(path: name))
+        }
+        XCTAssertEqual(
+            Library.backupsToPrune(in: backups, keeping: 2).map(\.lastPathComponent),
+            ["Iconery Backup 2026-09-01 at 10.00.00.zip"],
+            "only the oldest of this app's backups; other files are never touched"
+        )
+        XCTAssertEqual(Library.backupsToPrune(in: backups, keeping: 0), [], "0 keeps everything")
+    }
+
+    @MainActor
+    func testScheduledBackupRunsOnlyWhenDue() async throws {
+        let preferences = preferences { $0.backupSchedule = .daily }
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)
+        library.createSet(named: "Set")
+        let backups = folder.appending(path: "Backups")
+        try library.changeBackupFolder(to: backups)
+        func count() throws -> Int {
+            try FileManager.default.contentsOfDirectory(atPath: backups.path(percentEncoded: false))
+                .count
+        }
+
+        await library.backUpIfDue()
+        XCTAssertNil(library.notice)
+        XCTAssertEqual(try count(), 1, "never backed up, so one is due")
+        await library.backUpIfDue()
+        XCTAssertEqual(try count(), 1, "the next isn't due for a day")
+    }
+
     func testExportOptionsSavedBeforeICNSKeepTheirSizes() throws {
         let saved = #"{"format":"ico","pngSizes":[64],"icoSizes":[16,32]}"#
         let options = try JSONDecoder().decode(ExportOptions.self, from: Data(saved.utf8))
@@ -522,7 +785,7 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
-    func testBackupUnzipsToTheSameLibrary() throws {
+    func testBackupUnzipsToTheSameLibrary() async throws {
         let (_, source) = try makeSVGIcon()
         let library = Library(folder: folder.appending(path: "Library"))
         let outer = library.createSet(named: "Outer")
@@ -531,7 +794,7 @@ final class ExportTests: XCTestCase {
         library.toggleStar(Set(library.icons.map(\.id)))
 
         let backup = folder.appending(path: "Backup.zip")
-        try library.writeBackup(to: backup)
+        try await library.writeBackup(to: backup)
 
         let unpacked = folder.appending(path: "Unpacked")
         let unzip = try Process.run(

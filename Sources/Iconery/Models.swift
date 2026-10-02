@@ -30,6 +30,9 @@ struct Icon: Identifiable, Codable, Hashable {
     /// IconJar's "Description". Optional, like the two below it, so older libraries still decode.
     var info: String?
     var licenseID: UUID?
+    /// The file name it was imported from, without the extension, for "Original file name"
+    /// exports. Libraries from before it was kept have none and use the name instead.
+    var originalName: String?
 
     /// The copy inside the library folder, named by id so two icons called "home" never collide.
     var fileName: String { "\(id.uuidString).\(kind.rawValue)" }

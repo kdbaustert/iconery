@@ -18,7 +18,12 @@ There are no release builds yet; see [Contributing](#contributing) to build it.
   becomes a set, and its subfolders become sets inside it.
 - Sets nest as deep as you like. A set shows its own icons and those of every set inside it.
 - All Icons, Recently Used and Starred sit above your sets in the sidebar.
-- A zoomable grid (24 to 256 pt), with ⌘-click and ⇧-click selection and search by name.
+- A zoomable grid (24 to 256 pt), sorted by name, file type or date added, with names shown always,
+  on hover or never, and ⌘-click and ⇧-click selection.
+- Search by name, and by tags, set names or descriptions if you choose. Every word typed has to
+  match, so each one narrows the grid.
+- Imports skip files the library already has, compared by content, and can name an SVG after the
+  `<title>` inside it.
 - Each icon carries a name, tags, a description and a license. Licenses start with the nine
   IconJar ships with, and you can add your own.
 - An optional contrast fix draws one-color SVGs in black or white when they would be barely
@@ -45,13 +50,21 @@ There are no release builds yet; see [Contributing](#contributing) to build it.
 - Exports never overwrite: a clash becomes "home 2.png".
 - Open In sends an icon to any app that can open it, and remembers the one you picked.
 
+- File names from the icon's name, its original file name or its tags; set folders kept on
+  export; tags added as Finder tags; and SVG cleanup (width and height, comments, the XML
+  declaration, whitespace).
+
 ### Settings
 
-- Appearance: follow macOS, or always Light or Dark.
-- Move the library to any folder, or switch to another library. It is found again even after the
-  folder is renamed or moved in Finder.
-- Back up the whole library to a dated zip, in iCloud Drive by default. Unzip a backup and switch
-  to it to restore.
+- General: appearance (follow macOS, or always Light or Dark), grid sorting and names, what search
+  looks at, how many icons Recently Used keeps, and whether deleting asks first.
+- Library: move the library to any folder or switch to another, found again even after the folder
+  is renamed or moved in Finder. Back up the whole library to a dated zip, in iCloud Drive by
+  default, by hand or daily or weekly, keeping as many as you choose. Unzip a backup and switch to
+  it to restore.
+- Import: where loose files go, skipping duplicates, and SVG titles as names.
+- Export: file naming, set folders, Finder tags, a fixed export folder or asking each time,
+  showing exports in Finder, and SVG cleanup.
 
 ## Limits
 

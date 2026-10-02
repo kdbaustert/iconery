@@ -33,6 +33,7 @@ struct ContentView: View {
                 }
         }
         .onChange(of: library.sidebar) { library.selection = [] }
+        .task { await library.runBackupSchedule() }
         .alert(
             library.naming?.title ?? "", isPresented: isPresent(\.naming),
             presenting: library.naming

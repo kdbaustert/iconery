@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Observation
 import UniformTypeIdentifiers
 
@@ -45,11 +46,18 @@ final class Library {
     var iconsFolder: URL { folder.appending(path: "Icons", directoryHint: .isDirectory) }
     private var indexURL: URL { folder.appending(path: "library.json") }
 
-    static let recentLimit = 100
+    let preferences: Preferences
+    /// Where Export writes without asking; nil asks each time.
+    private(set) var exportFolder: URL?
+    private(set) var isBackingUp = false
+    @ObservationIgnored private var duplicates: DuplicateFinder?
 
     /// Opens the library chosen in Settings, or the default one. Passing `folder` opens that
-    /// library instead and ignores the remembered one, which tests rely on.
-    init(folder: URL? = nil) {
+    /// library instead and ignores the remembered one, which tests rely on, as they do on passing
+    /// their own `preferences`.
+    init(folder: URL? = nil, preferences: Preferences = .shared) {
+        self.preferences = preferences
+        exportFolder = Self.storedURL(Self.exportKey)
         let remembered = Self.storedURL(Self.libraryKey)
         self.folder = folder ?? remembered ?? Self.defaultFolder
         backupFolder = Self.storedURL(Self.backupKey) ?? Self.defaultBackupFolder
@@ -158,17 +166,31 @@ final class Library {
     func icons(in item: SidebarItem?) -> [Icon] {
         switch item {
         case .all, nil:
-            icons.sorted(by: Self.byName)
+            sorted(icons)
         case .starred:
-            icons.filter(\.starred).sorted(by: Self.byName)
+            sorted(icons.filter(\.starred))
         case .recent:
             Array(
                 icons.filter { $0.lastUsed != nil }
                     .sorted { ($0.lastUsed ?? .distantPast) > ($1.lastUsed ?? .distantPast) }
-                    .prefix(Self.recentLimit)
+                    .prefix(preferences.recentLimit)
             )
         case .set(let id):
-            icons.filter(isInside(id)).sorted(by: Self.byName)
+            sorted(icons.filter(isInside(id)))
+        }
+    }
+
+    /// In the order Settings ▸ General picks. Date Added puts the newest first.
+    private func sorted(_ icons: [Icon]) -> [Icon] {
+        switch preferences.sort {
+        case .name:
+            icons.sorted(by: Self.byName)
+        case .fileType:
+            icons.sorted {
+                $0.kind == $1.kind ? Self.byName($0, $1) : $0.kind.rawValue < $1.kind.rawValue
+            }
+        case .dateAdded:
+            icons.sorted { $0.added > $1.added }
         }
     }
 
@@ -182,20 +204,26 @@ final class Library {
         switch item {
         case .all: icons.count
         case .starred: icons.count(where: \.starred)
-        case .recent: min(icons.count { $0.lastUsed != nil }, Self.recentLimit)
+        case .recent: min(icons.count { $0.lastUsed != nil }, preferences.recentLimit)
         case .set(let id): icons.count(where: isInside(id))
         }
     }
 
     var visibleIcons: [Icon] {
-        let setNames = Dictionary(uniqueKeysWithValues: sets.map { ($0.id, $0.name) })
-        return icons(in: sidebar).filter {
-            iconMatches($0, query: searchText, setName: setNames[$0.setID] ?? "")
+        let shown = icons(in: sidebar)
+        guard !searchText.trimmingCharacters(in: .whitespaces).isEmpty else { return shown }
+        let paths = Dictionary(uniqueKeysWithValues: setPaths.map { ($0.set.id, $0.path) })
+        let scope = SearchScope(
+            tags: preferences.searchesTags, setNames: preferences.searchesSetNames,
+            descriptions: preferences.searchesDescriptions
+        )
+        return shown.filter {
+            iconMatches($0, query: searchText, setPath: paths[$0.setID] ?? "", scope: scope)
         }
     }
 
     var selectedIcons: [Icon] {
-        icons.filter { selection.contains($0.id) }.sorted(by: Self.byName)
+        sorted(icons.filter { selection.contains($0.id) })
     }
 
     var currentSetID: UUID? {
@@ -389,6 +417,15 @@ final class Library {
         save()
     }
 
+    /// Asks first, unless Settings says not to.
+    func requestDeleteIcons(_ ids: Set<UUID>) {
+        if preferences.confirmsIconDeletion {
+            pendingDeletion = .icons(ids)
+        } else {
+            perform(.icons(ids))
+        }
+    }
+
     private func removeIcons(_ ids: Set<UUID>) {
         for icon in icons where ids.contains(icon.id) {
             try? FileManager.default.removeItem(at: fileURL(for: icon))
@@ -519,7 +556,11 @@ final class Library {
     struct ImportReport {
         var imported = 0
         var skipped: [String] = []
+        /// Files left out because the library already had them.
+        var duplicates = 0
+        /// The sets folders became at the top of the import, then every set it made.
         var createdSets: [UUID] = []
+        var allCreated: [UUID] = []
     }
 
     /// A folder becomes a set named after it, inside `target` when there is one, and each
@@ -528,6 +569,8 @@ final class Library {
     @discardableResult
     func importItems(_ urls: [URL], into target: UUID?) -> ImportReport {
         var report = ImportReport()
+        duplicates = preferences.skipsDuplicates ? DuplicateFinder(files: icons.map(fileURL)) : nil
+        defer { duplicates = nil }
         for url in urls {
             if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
                 guard let folder = Self.scan(url) else {
@@ -536,9 +579,14 @@ final class Library {
                 }
                 report.createdSets.append(importFolder(folder, inside: target, report: &report))
             } else {
-                add(url, to: target ?? unsortedSetID(), report: &report)
+                add(url, to: target ?? looseFilesSetID(), report: &report)
             }
         }
+        // A folder whose every file was already here would leave its set standing empty.
+        let empty = Set(report.allCreated.filter { count(in: .set($0)) == 0 })
+        sets.removeAll { empty.contains($0.id) }
+        expandedSets.subtract(empty)
+        report.createdSets.removeAll { empty.contains($0) }
         save()
         return report
     }
@@ -580,6 +628,7 @@ final class Library {
         _ folder: ScannedFolder, inside parent: UUID?, report: inout ImportReport
     ) -> UUID {
         let setID = makeSet(named: folder.url.lastPathComponent, inside: parent).id
+        report.allCreated.append(setID)
         for file in folder.files { add(file, to: setID, report: &report) }
         for subfolder in folder.subfolders {
             importFolder(subfolder, inside: setID, report: &report)
@@ -611,11 +660,19 @@ final class Library {
 
         let report = importItems(files, into: target)
         if report.createdSets.count == 1 { sidebar = .set(report.createdSets[0]) }
+        var lines: [String] = []
+        if report.duplicates > 0 {
+            let count = plural(report.duplicates, "file")
+            lines.append("\(count) already in the library were left out.")
+        }
         if !report.skipped.isEmpty {
+            let skipped = Self.listed(report.skipped)
+            lines.append("Skipped what isn't a readable SVG, PNG, ICNS or ICO:\n" + skipped)
+        }
+        if !lines.isEmpty {
             notice = Notice(
                 title: "Imported \(plural(report.imported, "icon"))",
-                message: "Skipped what isn't a readable SVG, PNG, ICNS or ICO:\n"
-                    + Self.listed(report.skipped)
+                message: lines.joined(separator: "\n\n")
             )
         }
         return report.imported > 0
@@ -650,18 +707,38 @@ final class Library {
             report.skipped.append(url.lastPathComponent)
             return
         }
-        let name = url.deletingPathExtension().lastPathComponent
-        let icon = Icon(name: name, setID: setID, kind: kind)
+        if duplicates?.contains(url) == true {
+            report.duplicates += 1
+            return
+        }
+        let stem = url.deletingPathExtension().lastPathComponent
+        var icon = Icon(name: stem, setID: setID, kind: kind)
+        icon.originalName = stem
+        if kind == .svg, preferences.readsSVGTitles,
+           let text = try? String(contentsOf: url, encoding: .utf8) {
+            let named = SVGCleaner.titleAndDescription(of: text)
+            if let title = named.title { icon.name = title }
+            // Sketch and Figma write "Created with …" there, which describes nothing.
+            icon.info = named.description.flatMap { $0.hasPrefix("Created with") ? nil : $0 }
+        }
         do {
             try FileManager.default.createDirectory(
                 at: iconsFolder, withIntermediateDirectories: true
             )
             try FileManager.default.copyItem(at: url, to: fileURL(for: icon))
             icons.append(icon)
+            duplicates?.insert(url)
             report.imported += 1
         } catch {
             report.skipped.append("\(url.lastPathComponent) (\(error.localizedDescription))")
         }
+    }
+
+    /// The set Settings names for loose files, or "Unsorted" when it names none or that set is
+    /// gone.
+    private func looseFilesSetID() -> UUID {
+        if let id = preferences.looseFilesSetID, sets.contains(where: { $0.id == id }) { return id }
+        return unsortedSetID()
     }
 
     private func unsortedSetID() -> UUID {
@@ -809,6 +886,7 @@ final class Library {
     nonisolated static let libraryKey = "libraryLocation"
     nonisolated static let backupKey = "backupLocation"
     nonisolated static let lastBackupKey = "lastBackup"
+    nonisolated static let exportKey = "exportLocation"
 
     /// Locations are kept as bookmarks rather than paths, so a folder renamed or moved in Finder
     /// is still found.
@@ -888,22 +966,28 @@ final class Library {
 
     /// File ▸ Back Up Library Now. Settings calls `backUp(into:)` and shows its own errors.
     func backUpNow() {
-        do {
-            let url = try backUp(into: backupFolder)
-            NSWorkspace.shared.activateFileViewerSelecting([url])
-        } catch {
-            notice = Notice(
-                title: "The backup could not be written", message: error.localizedDescription
-            )
+        Task {
+            do {
+                let url = try await backUp(into: backupFolder)
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } catch {
+                notice = Notice(
+                    title: "The backup could not be written", message: error.localizedDescription
+                )
+            }
         }
     }
 
-    /// Writes "Iconery Backup <date> at <time>.zip" into `destination`.
+    /// Writes "Iconery Backup <date> at <time>.zip" into `destination`, then trims the folder to
+    /// the number of backups Settings keeps.
     @discardableResult
-    func backUp(into destination: URL) throws -> URL {
-        guard !Self.isInside(destination, folder) else {
-            throw Problem.backupInsideLibrary
+    func backUp(into destination: URL) async throws -> URL {
+        guard !Self.isInside(destination, folder) else { throw Problem.backupInsideLibrary }
+        guard !isBackingUp else {
+            throw Problem(errorDescription: "A backup is already being written.")
         }
+        isBackingUp = true
+        defer { isBackingUp = false }
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         let stamp = DateFormatter()
         stamp.locale = Locale(identifier: "en_US_POSIX")
@@ -911,17 +995,25 @@ final class Library {
         stamp.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
         let name = "Iconery Backup \(stamp.string(from: .now)).zip"
         let url = Exporter.uniqueURL(for: name, in: destination)
-        try writeBackup(to: url)
+        try await writeBackup(to: url)
         lastBackup = .now
         UserDefaults.standard.set(lastBackup, forKey: Self.lastBackupKey)
+        Self.pruneBackups(in: destination, keeping: preferences.backupsKept)
         return url
     }
 
     /// Zips the library folder exactly as it sits on disk (the index plus every icon file), so
     /// sets, nesting, tags and stars all survive and a restore is a straight swap back. `ditto`
-    /// because it ships with macOS and Foundation has no zip writer.
-    func writeBackup(to url: URL) throws {
+    /// because it ships with macOS and Foundation has no zip writer. It runs while the window
+    /// stays responsive: a library of large ICNS files takes a while to zip.
+    func writeBackup(to url: URL) async throws {
         save()  // the index on disk now matches what the window shows
+        // ditto's complaints go to a file rather than a pipe, which a long one could fill and
+        // stall.
+        let log = FileManager.default.temporaryDirectory
+            .appending(path: "iconery-backup-\(UUID().uuidString).log")
+        FileManager.default.createFile(atPath: log.path(percentEncoded: false), contents: nil)
+        defer { try? FileManager.default.removeItem(at: log) }
         let process = Process()
         process.executableURL = URL(filePath: "/usr/bin/ditto")
         // --keepParent puts the folder itself at the top of the archive, not its contents loose.
@@ -929,14 +1021,66 @@ final class Library {
             "-c", "-k", "--sequesterRsrc", "--keepParent",
             folder.path(percentEncoded: false), url.path(percentEncoded: false),
         ]
-        let errors = Pipe()
-        process.standardError = errors
-        try process.run()
-        // Read before waiting: a full pipe would otherwise stall ditto while it waits on us.
-        let message = errors.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw Problem(errorDescription: String(decoding: message, as: UTF8.self))
+        process.standardError = try FileHandle(forWritingTo: log)
+        let status = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Int32, Error>) in
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+        guard status == 0 else {
+            let message = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            throw Problem(
+                errorDescription: message.isEmpty ? "ditto stopped with status \(status)." : message
+            )
+        }
+    }
+
+    /// Moves backups in `folder` past the newest `keep` to the Trash, where they can still be
+    /// fished out.
+    static func pruneBackups(in folder: URL, keeping keep: Int) {
+        for old in backupsToPrune(in: folder, keeping: keep) {
+            try? FileManager.default.trashItem(at: old, resultingItemURL: nil)
+        }
+    }
+
+    /// The backups in `folder` older than the newest `keep`. Only files named the way
+    /// `backUp(into:)` names them count, and those names sort in date order. 0 keeps everything.
+    nonisolated static func backupsToPrune(in folder: URL, keeping keep: Int) -> [URL] {
+        guard keep > 0 else { return [] }
+        let backups = ((try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: nil
+        )) ?? [])
+            .filter {
+                $0.lastPathComponent.hasPrefix("Iconery Backup ") && $0.pathExtension == "zip"
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return Array(backups.dropLast(keep))
+    }
+
+    /// Backs up whenever the schedule in Settings says one is due: first shortly after launch,
+    /// then hourly, for as long as the window is open.
+    func runBackupSchedule() async {
+        try? await Task.sleep(for: .seconds(15))
+        while !Task.isCancelled {
+            await backUpIfDue()
+            try? await Task.sleep(for: .seconds(60 * 60))
+        }
+    }
+
+    func backUpIfDue() async {
+        guard let interval = preferences.backupSchedule.interval, !isBackingUp else { return }
+        if let lastBackup, Date.now.timeIntervalSince(lastBackup) < interval { return }
+        do {
+            try await backUp(into: backupFolder)
+        } catch {
+            notice = Notice(
+                title: "The scheduled backup could not be written",
+                message: error.localizedDescription
+            )
         }
     }
 
@@ -981,35 +1125,80 @@ final class Library {
         if export.presetID == id { export.presetID = nil }
     }
 
+    func setExportFolder(_ url: URL?) {
+        exportFolder = url
+        if let url {
+            Self.remember(url, as: Self.exportKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.exportKey)
+        }
+    }
+
     func exportSelection() {
         let targets = selectedIcons
         guard !targets.isEmpty, canExport else { return }
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.prompt = "Export"
-        let way = activePreset?.name ?? export.format.title
-        panel.message = "Choose where to save \(plural(targets.count, "icon")) as \(way)."
-        guard panel.runModal() == .OK, let folder = panel.url else { return }
-
-        var written: [URL] = []
-        var problems: [String] = []
-        for icon in targets {
-            do {
-                written += try Exporter.write(exportFiles(for: icon), to: folder)
-            } catch {
-                problems.append("\(icon.name): \(error.localizedDescription)")
-            }
+        let folder: URL
+        if let exportFolder {
+            folder = exportFolder
+        } else {
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.canCreateDirectories = true
+            panel.prompt = "Export"
+            let way = activePreset?.name ?? export.format.title
+            panel.message = "Choose where to save \(plural(targets.count, "icon")) as \(way)."
+            guard panel.runModal() == .OK, let chosen = panel.url else { return }
+            folder = chosen
         }
-        update(Set(targets.map(\.id))) { $0.lastUsed = .now }
-        if !written.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(written) }
+
+        let (written, problems) = export(targets, to: folder)
+        if preferences.revealsExports, !written.isEmpty {
+            NSWorkspace.shared.activateFileViewerSelecting(written)
+        }
         if !problems.isEmpty {
             notice = Notice(
                 title: "Exported \(plural(written.count, "file"))",
                 message: problems.joined(separator: "\n")
             )
         }
+    }
+
+    /// Writes every file for `icons` into `folder`, in set folders and with Finder tags when
+    /// Settings asks for them. Returns what was written and what went wrong, per icon.
+    func export(_ icons: [Icon], to folder: URL) -> (written: [URL], problems: [String]) {
+        var written: [URL] = []
+        var problems: [String] = []
+        for icon in icons {
+            do {
+                let destination = preferences.keepsSetFolders
+                    ? setFolder(for: icon, in: folder) : folder
+                let urls = try Exporter.write(exportFiles(for: icon), to: destination)
+                if preferences.addsFinderTags, !icon.tags.isEmpty {
+                    for url in urls {
+                        try? (url as NSURL).setResourceValue(icon.tags, forKey: .tagNamesKey)
+                    }
+                }
+                written += urls
+            } catch {
+                problems.append("\(icon.name): \(error.localizedDescription)")
+            }
+        }
+        update(Set(icons.map(\.id))) { $0.lastUsed = .now }
+        return (written, problems)
+    }
+
+    /// `folder`, then one folder per set from the top level down to the icon's own: IconJar's
+    /// "Maintain set hierarchy".
+    private func setFolder(for icon: Icon, in folder: URL) -> URL {
+        var names: [String] = []
+        var current = sets.first { $0.id == icon.setID }
+        // The bound only stops a parent loop in a damaged library.
+        while let set = current, names.count < 64 {
+            names.insert(Exporter.safeFileName(set.name), at: 0)
+            current = set.parentID.flatMap { parent in sets.first { $0.id == parent } }
+        }
+        return names.reduce(folder) { $0.appending(path: $1, directoryHint: .isDirectory) }
     }
 
     /// The drag carries real files, exported with the inspector's current settings, so Finder,
@@ -1036,5 +1225,43 @@ final class Library {
         update(ids) { $0.lastUsed = .now }
         let payload = written.count == 1 ? written[0] : folder
         return NSItemProvider(contentsOf: payload) ?? NSItemProvider()
+    }
+}
+
+/// Finds files the library already has, by content. Sizes are compared first, so only a file the
+/// same size as one already here is ever read and hashed.
+private struct DuplicateFinder {
+    private var bySize: [Int: [URL]] = [:]
+    private var hashes: [URL: Data] = [:]
+
+    init(files: [URL]) {
+        for url in files { insert(url) }
+    }
+
+    mutating func insert(_ url: URL) {
+        guard let size = Self.size(of: url) else { return }
+        bySize[size, default: []].append(url)
+    }
+
+    mutating func contains(_ url: URL) -> Bool {
+        guard let size = Self.size(of: url), let sameSize = bySize[size],
+              let hash = hash(of: url)
+        else { return false }
+        for other in sameSize where other != url {
+            if self.hash(of: other) == hash { return true }
+        }
+        return false
+    }
+
+    private mutating func hash(of url: URL) -> Data? {
+        if let known = hashes[url] { return known }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let hash = Data(SHA256.hash(data: data))
+        hashes[url] = hash
+        return hash
+    }
+
+    private static func size(of url: URL) -> Int? {
+        try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
     }
 }
