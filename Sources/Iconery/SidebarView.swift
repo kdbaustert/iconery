@@ -124,6 +124,7 @@ private struct SetRow: View {
                         .padding(-3)
                 }
             }
+            .draggable(Library.setDragURL(set.id))
             .dropDestination(for: URL.self) { urls, _ in
                 library.handleDrop(urls, onto: set.id)
             } isTargeted: { isTargeted = $0 }

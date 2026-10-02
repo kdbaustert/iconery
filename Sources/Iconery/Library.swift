@@ -1369,8 +1369,25 @@ final class Library {
     /// A drop of the grid's own drag arrives as the temporary export it carries, so it is told
     /// apart by where that file lives: onto a set it moves the dragged icons; anywhere else it is
     /// ignored rather than imported back as a copy.
+    /// How a sidebar set travels in a drag: a private scheme the drop side recognises, so the
+    /// row's one URL drop target serves files, grid drags and sets alike.
+    static func setDragURL(_ id: UUID) -> URL {
+        URL(string: "iconery-set://\(id.uuidString)")!
+    }
+
+    private static func draggedSetID(_ url: URL) -> UUID? {
+        url.scheme == "iconery-set" ? url.host().flatMap(UUID.init(uuidString:)) : nil
+    }
+
     @discardableResult
     func handleDrop(_ urls: [URL], onto setID: UUID?) -> Bool {
+        // A set dragged onto another nests it there; moveSet turns down a drop into the set's
+        // own subtree. Anywhere without a set under it, nothing happens.
+        if let dragged = urls.compactMap(Self.draggedSetID).first {
+            guard let setID, dragged != setID else { return false }
+            moveSet(dragged, into: setID)
+            return true
+        }
         // resolvingSymlinksInPath on both sides: a dropped URL may come back as /private/var/...
         // while temporaryDirectory says /var/...
         let dragRoot = Exporter.dragRoot.resolvingSymlinksInPath().path(percentEncoded: false)
