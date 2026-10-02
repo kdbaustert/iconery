@@ -9,6 +9,10 @@ struct SidebarView: View {
             Section("Library") {
                 row("All Icons", symbol: "square.grid.2x2", item: .all)
                 row("Recently Used", symbol: "clock", item: .recent)
+                    .contextMenu {
+                        Button("Clear Recently Used") { library.clearRecents() }
+                            .disabled(library.count(in: .recent) == 0)
+                    }
                 row("Starred", symbol: "star", item: .starred)
             }
             Section("Sets") {

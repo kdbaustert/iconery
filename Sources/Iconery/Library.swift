@@ -58,6 +58,9 @@ final class Library {
 
     @ObservationIgnored private var anchor: UUID?
     @ObservationIgnored private var draggingIDs: Set<UUID>?
+    /// Each dragged icon's Recently Used date from before the drag stamped it, so a drop that
+    /// turns out to be a move inside the app can put it back.
+    @ObservationIgnored private var draggedLastUsed: [UUID: Date?] = [:]
     private let images = NSCache<NSString, NSImage>()
     private let thumbnails = NSCache<NSString, CGImage>()
     /// nil inside means "looked, and it isn't one colour", so it is never worked out twice.
@@ -602,6 +605,10 @@ final class Library {
         update(ids) { $0.setID = setID }
     }
 
+    func clearRecents() {
+        update(Set(icons.filter { $0.lastUsed != nil }.map(\.id))) { $0.lastUsed = nil }
+    }
+
     func toggleStar(_ ids: Set<UUID>) {
         let star = !icons.filter { ids.contains($0.id) }.allSatisfy(\.starred)
         update(ids) { $0.starred = star }
@@ -867,7 +874,14 @@ final class Library {
         }
         guard fromGrid else { return importAndReport(urls, into: setID) }
         guard let setID, let ids = draggingIDs else { return false }
-        move(ids, to: setID)
+        // The drag stamped Recently Used when it began, because a drop into Finder or another
+        // app never reports back. Filing icons into a set isn't using them, so put the old
+        // dates back along with the move.
+        let before = draggedLastUsed
+        update(ids) {
+            $0.setID = setID
+            if let old = before[$0.id] { $0.lastUsed = old }
+        }
         return true
     }
 
@@ -1419,6 +1433,7 @@ final class Library {
         let ids = alone ? [icon.id] : targets(for: icon)
         draggingIDs = ids
         let dragged = icons.filter { ids.contains($0.id) }
+        draggedLastUsed = Dictionary(uniqueKeysWithValues: dragged.map { ($0.id, $0.lastUsed) })
         let folder = Exporter.dragRoot
             .appending(path: UUID().uuidString)
             .appending(path: dragged.count == 1 ? Exporter.safeFileName(icon.name) : "Icons")
