@@ -348,9 +348,13 @@ private struct IconMenu: View {
             library.exportSelection()
         }
         Divider()
-        // One icon at a time: there is no name a whole selection could share.
         if targets.count == 1 {
             Button("Rename…") { library.beginRename(icon) }
+        } else {
+            Button("Rename \(targets.count) Icons…") {
+                library.selection = targets
+                library.batchRenaming = true
+            }
         }
         let asks = library.preferences.confirmsIconDeletion
         Button(asks ? "Delete…" : "Delete", role: .destructive) {

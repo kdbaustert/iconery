@@ -599,6 +599,48 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
+    func testBatchRenameReplacesAddsAndSequences() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let set = library.createSet(named: "Set")
+        library.importItems(
+            [
+                try writeSVG("Arrow-Left", #"<path d="M1 1h4"/>"#),
+                try writeSVG("arrow-right", #"<path d="M2 1h4"/>"#),
+                try writeSVG("star", #"<path d="M3 1h4"/>"#),
+            ], into: set.id
+        )
+        let all = Set(library.icons.map(\.id))
+        func names() -> [String] { library.visibleIcons.map(\.name) }
+
+        // Replace ignores case, swaps every occurrence, and leaves non-matches alone.
+        var rename = BatchRename()
+        rename.mode = .replace
+        rename.find = "ARROW"
+        rename.replacement = "nav"
+        library.batchRename(all, applying: rename)
+        XCTAssertEqual(names(), ["nav-Left", "nav-right", "star"])
+
+        // Add wraps every name.
+        rename = BatchRename()
+        rename.mode = .add
+        rename.suffix = "-24"
+        library.batchRename(all, applying: rename)
+        XCTAssertEqual(names(), ["nav-Left-24", "nav-right-24", "star-24"])
+
+        // Sequence numbers in grid order from the chosen start.
+        rename = BatchRename()
+        rename.mode = .sequence
+        rename.base = "Glyph"
+        rename.startsAt = 3
+        library.batchRename(all, applying: rename)
+        XCTAssertEqual(names(), ["Glyph 3", "Glyph 4", "Glyph 5"])
+
+        // Empty inputs change nothing.
+        library.batchRename(all, applying: BatchRename())
+        XCTAssertEqual(names(), ["Glyph 3", "Glyph 4", "Glyph 5"])
+    }
+
+    @MainActor
     func testCheckLibraryFindsDuplicatesMissingFilesAndOrphans() async throws {
         // Duplicates have to get in, so import-time skipping is off.
         let preferences = preferences { $0.skipsDuplicates = false }

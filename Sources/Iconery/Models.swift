@@ -177,6 +177,53 @@ enum Deletion {
     }
 }
 
+/// How a batch rename makes each new name. `newName` is the one place the semantics live: the
+/// sheet's preview runs through it and the rename applies through it, so they can't disagree.
+struct BatchRename: Equatable {
+    enum Mode: String, CaseIterable, Identifiable {
+        case replace, add, sequence
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .replace: "Replace Text"
+            case .add: "Add Text"
+            case .sequence: "Sequence"
+            }
+        }
+    }
+
+    var mode = Mode.replace
+    // Replace Text
+    var find = ""
+    var replacement = ""
+    // Add Text
+    var prefix = ""
+    var suffix = ""
+    // Sequence: names become the base plus a number, in the grid's order.
+    var base = ""
+    var startsAt = 1
+
+    /// The new name for an icon called `name` at `index` of the selection, in grid order, or
+    /// nil to leave that icon alone. Callers trim the result and drop empty or unchanged names.
+    /// Replace swaps every occurrence, ignoring case as search does, and leaves non-matching
+    /// icons alone; Sequence numbers in grid order with Finder's "Name N" shape.
+    func newName(for name: String, index: Int) -> String? {
+        switch mode {
+        case .replace:
+            guard !find.isEmpty, name.localizedCaseInsensitiveContains(find) else { return nil }
+            return name.replacingOccurrences(of: find, with: replacement, options: .caseInsensitive)
+        case .add:
+            guard !prefix.isEmpty || !suffix.isEmpty else { return nil }
+            return prefix + name + suffix
+        case .sequence:
+            guard !base.isEmpty else { return nil }
+            return "\(base) \(startsAt + index)"
+        }
+    }
+}
+
 struct Notice {
     var title: String
     var message: String

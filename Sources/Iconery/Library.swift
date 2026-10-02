@@ -36,6 +36,8 @@ final class Library {
     /// Set after an edit that can re-sort the grid, like a rename under name sorting, so the
     /// grid scrolls to keep the icon in view. The grid clears it once it has scrolled.
     var revealed: UUID?
+    /// Shows the batch rename sheet for the selection.
+    var batchRenaming = false
     var pendingDeletion: Deletion?
 
     /// Alerts waiting their turn, oldest first. Two IconJar libraries dropped together, or a
@@ -944,6 +946,23 @@ final class Library {
     func toggleStar(_ ids: Set<UUID>) {
         let star = !icons.filter { ids.contains($0.id) }.allSatisfy(\.starred)
         recording(star ? "Star" : "Unstar") { update(ids) { $0.starred = star } }
+    }
+
+    /// Renames the selection in grid order through `rename.newName`, as one undoable step.
+    /// Icons it answers nil, an empty name or the same name for keep theirs.
+    func batchRename(_ ids: Set<UUID>, applying rename: BatchRename) {
+        let items = visibleIcons.filter { ids.contains($0.id) }
+        recording("Rename") {
+            for (index, icon) in items.enumerated() {
+                guard let raw = rename.newName(for: icon.name, index: index) else { continue }
+                let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty, name != icon.name,
+                      let at = icons.firstIndex(where: { $0.id == icon.id })
+                else { continue }
+                icons[at].name = name
+            }
+            save()
+        }
     }
 
     func rename(_ id: UUID, to name: String) {

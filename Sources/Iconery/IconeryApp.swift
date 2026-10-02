@@ -44,10 +44,17 @@ struct IconeryApp: App {
             // The selection's commands, so they exist in the menu bar and not only on
             // right-click. Copy lives in Edit and lights up through the grid's onCopyCommand.
             CommandMenu("Icon") {
-                Button("Rename…") {
-                    if let icon = library.selectedIcons.first { library.beginRename(icon) }
+                Button(
+                    library.selection.count > 1
+                        ? "Rename \(library.selection.count) Icons…" : "Rename…"
+                ) {
+                    if library.selection.count > 1 {
+                        library.batchRenaming = true
+                    } else if let icon = library.selectedIcons.first {
+                        library.beginRename(icon)
+                    }
                 }
-                .disabled(library.selection.count != 1)
+                .disabled(library.selection.isEmpty)
                 Button(library.selectionAllStarred ? "Unstar" : "Star") {
                     library.toggleStar(library.selection)
                 }
