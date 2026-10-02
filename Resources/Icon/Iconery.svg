@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="-50 -50 512 512">
+<!-- The magnifier is clipped to the rounded square. macOS 27 shrinks an icon into a grey tile when anything reaches outside that shape: measured on this artwork, with the handle poking out it was tiled, clipped it shows as itself. -->
+<defs><filter id="outer" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="10" stdDeviation="9" flood-color="#000" flood-opacity="0.22"/><feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000" flood-opacity="0.12"/></filter></defs>
+<g filter="url(#outer)">
+<defs>
+<path id="sq" d="M412.0,206.0 L411.7,283.6 L410.7,308.3 L409.2,326.0 L406.9,340.1 L404.1,352.0 L400.5,362.1 L396.2,370.9 L391.2,378.6 L385.3,385.3 L378.6,391.2 L370.9,396.2 L362.1,400.5 L352.0,404.1 L340.1,406.9 L326.0,409.2 L308.3,410.7 L283.6,411.7 L206.0,412.0 L128.4,411.7 L103.7,410.7 L86.0,409.2 L71.9,406.9 L60.0,404.1 L49.9,400.5 L41.1,396.2 L33.4,391.2 L26.7,385.3 L20.8,378.6 L15.8,370.9 L11.5,362.1 L7.9,352.0 L5.1,340.1 L2.8,326.0 L1.3,308.3 L0.3,283.6 L0.0,206.0 L0.3,128.4 L1.3,103.7 L2.8,86.0 L5.1,71.9 L7.9,60.0 L11.5,49.9 L15.8,41.1 L20.8,33.4 L26.7,26.7 L33.4,20.8 L41.1,15.8 L49.9,11.5 L60.0,7.9 L71.9,5.1 L86.0,2.8 L103.7,1.3 L128.4,0.3 L206.0,0.0 L283.6,0.3 L308.3,1.3 L326.0,2.8 L340.1,5.1 L352.0,7.9 L362.1,11.5 L370.9,15.8 L378.6,20.8 L385.3,26.7 L391.2,33.4 L396.2,41.1 L400.5,49.9 L404.1,60.0 L406.9,71.9 L409.2,86.0 L410.7,103.7 L411.7,128.4Z"></path>
+<clipPath id="clip"><use xlink:href="#sq"></use></clipPath>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FAFBFC"></stop><stop offset="1" stop-color="#A3A9B4"></stop></linearGradient>
+<linearGradient id="screen" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6E7BFF"></stop><stop offset="1" stop-color="#2D32C4"></stop></linearGradient>
+<linearGradient id="ring" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFFFFF"></stop><stop offset="0.5" stop-color="#B7BDC8"></stop><stop offset="1" stop-color="#6E7480"></stop></linearGradient>
+<filter id="ds" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="2" dy="10" stdDeviation="9" flood-color="#000000" flood-opacity="0.38"></feDropShadow></filter>
+</defs>
+<use xlink:href="#sq" fill="url(#bg)"></use>
+<g clip-path="url(#clip)">
+<rect x="40" y="40" width="332" height="332" rx="74" fill="#3A3E48"></rect>
+<rect x="48" y="48" width="316" height="316" rx="68" fill="url(#screen)"></rect>
+<g fill="rgba(255,255,255,0.22)">
+<rect x="84" y="84" width="70" height="70" rx="18"></rect>
+<rect x="171" y="84" width="70" height="70" rx="18"></rect>
+<rect x="258" y="84" width="70" height="70" rx="18"></rect>
+<rect x="84" y="171" width="70" height="70" rx="18"></rect>
+<rect x="171" y="171" width="70" height="70" rx="18"></rect>
+<rect x="84" y="258" width="70" height="70" rx="18"></rect>
+</g>
+<rect x="258" y="171" width="70" height="70" rx="18" fill="#FFC43D"></rect>
+<g fill="none" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="119" cy="119" r="14"></circle>
+<polygon points="206,104 220,132 192,132"></polygon>
+<rect x="279" y="105" width="28" height="28" rx="6"></rect>
+<polyline points="106,206 116,216 134,196"></polyline>
+<line x1="206" y1="192" x2="206" y2="220"></line>
+<line x1="192" y1="206" x2="220" y2="206"></line>
+<polygon points="119,277 133,293 119,309 105,293"></polygon>
+</g>
+<rect x="48" y="48" width="316" height="316" rx="68" fill="none" stroke="rgba(0,0,0,0.35)" stroke-width="3"></rect>
+</g>
+<use xlink:href="#sq" fill="none" stroke="rgba(255,255,255,0.8)" stroke-width="2"></use>
+<g clip-path="url(#clip)"><g filter="url(#ds)">
+<line x1="330" y1="330" x2="396" y2="396" stroke="#2A2D35" stroke-width="30" stroke-linecap="round"></line>
+<circle cx="280" cy="280" r="74" fill="rgba(255,255,255,0.18)" stroke="url(#ring)" stroke-width="16"></circle>
+</g>
+</g><path d="M232,250 C240,230 256,216 278,212" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" opacity="0.8"></path>
+</g>
+</svg>

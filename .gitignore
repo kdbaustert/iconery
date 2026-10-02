@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+# Finder's custom folder icon file is "Icon" plus a carriage return. The next line is "Icon" and two
+# of them, since git strips one; a bare "Icon" would also hide Resources/Icon.
+Icon
+
+# Build output: build.sh assembles the app in /build, SwiftPM works in /.build
+/build
+/.build
+/.swiftpm
+DerivedData/
+*.app
+*.dSYM
+*.dSYM.zip
+*.o
+*.swiftmodule
+*.profraw
+*.profdata
+
+# Xcode user state, should the package be opened in Xcode
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# Claude Code: personal settings and agents' local memory. A shared .claude/settings.json is kept.
+.claude/settings.local.json
+.claude/agent-memory/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and scratch
+*.log
+*.tmp
