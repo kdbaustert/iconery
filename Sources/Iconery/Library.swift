@@ -28,6 +28,9 @@ final class Library {
     }
     var naming: Naming?
     var draftName = ""
+    /// Set after an edit that can re-sort the grid, like a rename under name sorting, so the
+    /// grid scrolls to keep the icon in view. The grid clears it once it has scrolled.
+    var revealed: UUID?
     var pendingDeletion: Deletion?
 
     /// Alerts waiting their turn, oldest first. Two IconJar libraries dropped together, or a
@@ -608,6 +611,7 @@ final class Library {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
         update([id]) { $0.name = name }
+        revealed = id
     }
 
     func setTags(_ id: UUID, _ tags: [String]) {

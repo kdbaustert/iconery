@@ -43,6 +43,11 @@ struct IconGridView: View {
                 .onGeometryChange(for: Double.self) { $0.size.width } action: { gridWidth = $0 }
                 .padding(16)
                 .onChange(of: keyedID) { if let keyedID { proxy.scrollTo(keyedID) } }
+                .onChange(of: library.revealed) {
+                    guard let id = library.revealed else { return }
+                    withAnimation { proxy.scrollTo(id) }
+                    library.revealed = nil
+                }
             }
         }
         .contentShape(Rectangle())
