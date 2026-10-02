@@ -1,3 +1,4 @@
+import QuickLook
 import SwiftUI
 
 struct IconGridView: View {
@@ -10,6 +11,9 @@ struct IconGridView: View {
     @State private var gridWidth = 0.0
     /// The icon the arrow keys last selected, kept in view as it changes.
     @State private var keyedID: UUID?
+    /// What Quick Look is showing: the file in the panel, among the copies made when it opened.
+    @State private var quickLookItem: URL?
+    @State private var quickLookItems: [URL] = []
     private static let columnSpacing = 10.0
 
     var body: some View {
@@ -37,7 +41,11 @@ struct IconGridView: View {
                         }
                         .accessibilityAction { library.click(icon.id, in: icons, modifiers: []) }
                         .onDrag { library.dragProvider(for: icon) }
-                        .contextMenu { IconMenu(icon: icon) }
+                        .contextMenu {
+                            IconMenu(icon: icon) {
+                                quickLook(library.targets(for: icon))
+                            }
+                        }
                     }
                 }
                 .onGeometryChange(for: Double.self) { $0.size.width } action: { gridWidth = $0 }
@@ -69,6 +77,13 @@ struct IconGridView: View {
             library.requestDeleteIcons(library.selection)
             return .handled
         }
+        // Space previews, as in Finder.
+        .onKeyPress(.space) {
+            guard !library.selection.isEmpty else { return .ignored }
+            quickLook(library.selection)
+            return .handled
+        }
+        .quickLookPreview($quickLookItem, in: quickLookItems)
         // Return renames, as in Finder.
         .onKeyPress(.return) {
             guard library.selection.count == 1, let icon = library.selectedIcons.first else {
@@ -110,6 +125,11 @@ struct IconGridView: View {
             library.handleDrop(urls, onto: library.currentSetID)
         } isTargeted: { isDropTarget = $0 }
         .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar(count: icons.count) }
+    }
+
+    private func quickLook(_ ids: Set<UUID>) {
+        quickLookItems = library.quickLookURLs(for: ids)
+        quickLookItem = quickLookItems.first
     }
 
     @ViewBuilder
@@ -278,10 +298,13 @@ private struct IconCell: View {
 private struct IconMenu: View {
     @Environment(Library.self) private var library
     let icon: Icon
+    let quickLook: () -> Void
 
     var body: some View {
         let targets = library.targets(for: icon)
         let allStarred = library.icons.filter { targets.contains($0.id) }.allSatisfy(\.starred)
+        Button("Quick Look") { quickLook() }
+        Divider()
         Button(allStarred ? "Unstar" : "Star") { library.toggleStar(targets) }
         Menu("Move to Set") {
             ForEach(library.setPaths, id: \.set.id) { entry in

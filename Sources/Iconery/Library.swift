@@ -729,6 +729,21 @@ final class Library {
     static let openRoot = FileManager.default.temporaryDirectory
         .appending(path: "IconeryOpen", directoryHint: .isDirectory)
 
+    /// Copies for Quick Look, named after the icons so the panel's title is the name rather
+    /// than the library's id-named file, in the grid's order so its arrows walk the selection
+    /// as the grid shows it. Previewing isn't using, so Recently Used is left alone.
+    func quickLookURLs(for ids: Set<UUID>) -> [URL] {
+        let shown = visibleIcons.filter { ids.contains($0.id) }
+        let folder = Self.openRoot.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let files: [ExportFile] = shown.compactMap { icon in
+            guard let data = try? Data(contentsOf: fileURL(for: icon)) else { return nil }
+            return ExportFile(
+                name: "\(Exporter.safeFileName(icon.name)).\(icon.kind.rawValue)", data: data
+            )
+        }
+        return (try? Exporter.write(files, to: folder)) ?? []
+    }
+
     /// Opens a copy named after the icon, so the other app shows its name rather than the
     /// library's id-named file, and nothing saved there can change the library. `app` nil uses
     /// the file type's default app.
