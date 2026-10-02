@@ -192,7 +192,7 @@ private struct LibrarySettings: View {
                     }
                     settingsNote(
                         "Move takes the whole library to a folder you choose. Switch opens "
-                            + "another Iconery library, such as an unzipped backup."
+                            + "another Iconery library, such as a backup opened in Finder."
                     )
                 }
             }

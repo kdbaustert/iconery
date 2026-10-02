@@ -1732,8 +1732,9 @@ final class Library {
         }
     }
 
-    /// Writes "Iconery Backup <date> at <time>.zip" into `destination`, then trims the folder to
-    /// the number of backups Settings keeps.
+    /// Writes "Iconery Backup <date> at <time>.iconerybackup" into `destination`, then trims the
+    /// folder to the number of backups Settings keeps. The file is a zip under Iconery's own type,
+    /// declared in Info.plist as conforming to zip, so Archive Utility still unpacks it.
     @discardableResult
     func backUp(into destination: URL) async throws -> URL {
         guard !Self.isInside(destination, folder) else { throw Problem.backupInsideLibrary }
@@ -1747,7 +1748,7 @@ final class Library {
         stamp.locale = Locale(identifier: "en_US_POSIX")
         // Sorts by name in date order, and has no colon, which a file name can't hold.
         stamp.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let name = "Iconery Backup \(stamp.string(from: .now)).zip"
+        let name = "Iconery Backup \(stamp.string(from: .now)).iconerybackup"
         let url = Exporter.uniqueURL(for: name, in: destination)
         try await writeBackup(to: url)
         lastBackup = .now
@@ -1808,13 +1809,15 @@ final class Library {
 
     /// The backups in `folder` older than the newest `keep`. Only files named the way
     /// `backUp(into:)` names them count, and those names sort in date order. 0 keeps everything.
+    /// Backups made before they had their own type ended in .zip, and still count.
     nonisolated static func backupsToPrune(in folder: URL, keeping keep: Int) -> [URL] {
         guard keep > 0 else { return [] }
         let backups = ((try? FileManager.default.contentsOfDirectory(
             at: folder, includingPropertiesForKeys: nil
         )) ?? [])
             .filter {
-                $0.lastPathComponent.hasPrefix("Iconery Backup ") && $0.pathExtension == "zip"
+                $0.lastPathComponent.hasPrefix("Iconery Backup ")
+                    && ["iconerybackup", "zip"].contains($0.pathExtension)
             }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         return Array(backups.dropLast(keep))

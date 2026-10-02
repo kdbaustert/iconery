@@ -41,6 +41,38 @@
 				<string>com.microsoft.ico</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Iconery Backup</string>
+			<key>CFBundleTypeRole</key>
+			<string>None</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>dev.kennyb.Iconery.backup</string>
+			</array>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>dev.kennyb.Iconery.backup</string>
+			<key>UTTypeDescription</key>
+			<string>Iconery Backup</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.zip-archive</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>iconerybackup</string>
+				</array>
+			</dict>
+		</dict>
 	</array>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>

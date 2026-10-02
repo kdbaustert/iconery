@@ -59,9 +59,9 @@ There are no release builds yet; see [Contributing](#contributing) to build it.
 - General: appearance (follow macOS, or always Light or Dark), grid sorting and names, what search
   looks at, how many icons Recently Used keeps, and whether deleting asks first.
 - Library: move the library to any folder or switch to another, found again even after the folder
-  is renamed or moved in Finder. Back up the whole library to a dated zip, in iCloud Drive by
-  default, by hand or daily or weekly, keeping as many as you choose. Unzip a backup and switch to
-  it to restore.
+  is renamed or moved in Finder. Back up the whole library to a dated `.iconerybackup` file, in
+  iCloud Drive by default, by hand or daily or weekly, keeping as many as you choose. To restore,
+  open a backup in Finder, which unpacks it, and switch to the folder that comes out.
 - Import: where loose files go, skipping duplicates, and SVG titles as names.
 - Export: file naming, set folders, Finder tags, a fixed export folder or asking each time,
   showing exports in Finder, and SVG cleanup.

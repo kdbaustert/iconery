@@ -178,7 +178,7 @@ final class ExportTests: XCTestCase {
         let second = try await library.backUp(into: backups)
 
         XCTAssertTrue(first.lastPathComponent.hasPrefix("Iconery Backup "))
-        XCTAssertEqual(first.pathExtension, "zip")
+        XCTAssertEqual(first.pathExtension, "iconerybackup")
         XCTAssertNotEqual(first, second, "two backups in the same second don't overwrite")
         XCTAssertNotNil(library.lastBackup)
         let inside = library.folder.appending(path: "Backups")
@@ -1050,17 +1050,22 @@ final class ExportTests: XCTestCase {
         let backups = folder.appending(path: "Backups")
         try FileManager.default.createDirectory(at: backups, withIntermediateDirectories: true)
         for name in [
-            "Iconery Backup 2026-09-02 at 10.00.00.zip",
+            "Iconery Backup 2026-09-02 at 10.00.00.iconerybackup",
             "Iconery Backup 2026-09-01 at 10.00.00.zip",
-            "Iconery Backup 2026-09-03 at 10.00.00.zip",
+            "Iconery Backup 2026-09-03 at 10.00.00.iconerybackup",
+            "Iconery Backup 2026-09-04 at 10.00.00.iconerybackup",
             "Notes.zip", "Iconery Backup.txt",
         ] {
             try Data().write(to: backups.appending(path: name))
         }
         XCTAssertEqual(
             Library.backupsToPrune(in: backups, keeping: 2).map(\.lastPathComponent),
-            ["Iconery Backup 2026-09-01 at 10.00.00.zip"],
-            "only the oldest of this app's backups; other files are never touched"
+            [
+                "Iconery Backup 2026-09-01 at 10.00.00.zip",
+                "Iconery Backup 2026-09-02 at 10.00.00.iconerybackup",
+            ],
+            "only the oldest of this app's backups, old .zip ones included; other files are "
+                + "never touched"
         )
         XCTAssertEqual(Library.backupsToPrune(in: backups, keeping: 0), [], "0 keeps everything")
     }
@@ -1104,7 +1109,7 @@ final class ExportTests: XCTestCase {
         library.importItems([source], into: inner.id)
         library.toggleStar(Set(library.icons.map(\.id)))
 
-        let backup = folder.appending(path: "Backup.zip")
+        let backup = folder.appending(path: "Backup.iconerybackup")
         try await library.writeBackup(to: backup)
 
         let unpacked = folder.appending(path: "Unpacked")
