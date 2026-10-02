@@ -87,18 +87,20 @@ enum SidebarItem: Hashable {
 enum Naming {
     case newSet(parent: UUID?)
     case renameSet(UUID)
+    case renameIcon(UUID)
 
     var title: String {
         switch self {
         case .newSet: "New Set"
         case .renameSet: "Rename Set"
+        case .renameIcon: "Rename Icon"
         }
     }
 
     var confirmTitle: String {
         switch self {
         case .newSet: "Create"
-        case .renameSet: "Rename"
+        case .renameSet, .renameIcon: "Rename"
         }
     }
 }

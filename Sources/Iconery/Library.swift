@@ -525,12 +525,18 @@ final class Library {
         naming = .renameSet(set.id)
     }
 
+    func beginRename(_ icon: Icon) {
+        draftName = icon.name
+        naming = .renameIcon(icon.id)
+    }
+
     func finishNaming(_ naming: Naming) {
         let name = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
         switch naming {
         case .newSet(let parent): sidebar = .set(createSet(named: name, inside: parent).id)
         case .renameSet(let id): renameSet(id, to: name)
+        case .renameIcon(let id): rename(id, to: name)
         }
     }
 

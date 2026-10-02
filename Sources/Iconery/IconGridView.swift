@@ -64,6 +64,14 @@ struct IconGridView: View {
             library.requestDeleteIcons(library.selection)
             return .handled
         }
+        // Return renames, as in Finder.
+        .onKeyPress(.return) {
+            guard library.selection.count == 1, let icon = library.selectedIcons.first else {
+                return .ignored
+            }
+            library.beginRename(icon)
+            return .handled
+        }
         .onKeyPress(keys: [.leftArrow, .rightArrow, .upArrow, .downArrow]) { press in
             // How an adaptive grid fits its columns.
             let fit = (gridWidth + Self.columnSpacing) / (cellWidth + Self.columnSpacing)
@@ -280,6 +288,10 @@ private struct IconMenu: View {
             library.exportSelection()
         }
         Divider()
+        // One icon at a time: there is no name a whole selection could share.
+        if targets.count == 1 {
+            Button("Rename…") { library.beginRename(icon) }
+        }
         let asks = library.preferences.confirmsIconDeletion
         Button(asks ? "Delete…" : "Delete", role: .destructive) {
             library.requestDeleteIcons(targets)
