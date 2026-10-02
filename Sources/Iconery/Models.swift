@@ -38,6 +38,13 @@ struct Icon: Identifiable, Codable, Hashable {
     var fileName: String { "\(id.uuidString).\(kind.rawValue)" }
 }
 
+/// A saved search in the sidebar, run against the live library each time it's shown.
+struct SmartSet: Identifiable, Codable, Hashable {
+    var id = UUID()
+    var name: String
+    var query: String
+}
+
 struct License: Identifiable, Codable, Hashable {
     var id = UUID()
     var name: String
@@ -82,6 +89,8 @@ struct License: Identifiable, Codable, Hashable {
 enum SidebarItem: Hashable {
     case all, recent, starred
     case set(UUID)
+    case smart(UUID)
+    case tag(String)
 
     /// A defaults-friendly form, so the selection can be restored at the next launch.
     var stored: String {
@@ -90,6 +99,8 @@ enum SidebarItem: Hashable {
         case .recent: "recent"
         case .starred: "starred"
         case .set(let id): "set:\(id.uuidString)"
+        case .smart(let id): "smart:\(id.uuidString)"
+        case .tag(let tag): "tag:\(tag)"
         }
     }
 
@@ -99,10 +110,16 @@ enum SidebarItem: Hashable {
         case "recent": self = .recent
         case "starred": self = .starred
         default:
-            guard stored.hasPrefix("set:"),
-                  let id = UUID(uuidString: String(stored.dropFirst(4)))
-            else { return nil }
-            self = .set(id)
+            if stored.hasPrefix("set:"), let id = UUID(uuidString: String(stored.dropFirst(4))) {
+                self = .set(id)
+            } else if stored.hasPrefix("smart:"),
+                      let id = UUID(uuidString: String(stored.dropFirst(6))) {
+                self = .smart(id)
+            } else if stored.hasPrefix("tag:"), stored.count > 4 {
+                self = .tag(String(stored.dropFirst(4)))
+            } else {
+                return nil
+            }
         }
     }
 }
@@ -111,19 +128,24 @@ enum Naming {
     case newSet(parent: UUID?)
     case renameSet(UUID)
     case renameIcon(UUID)
+    case renameSmartSet(UUID)
+    case editSmartSetQuery(UUID)
 
     var title: String {
         switch self {
         case .newSet: "New Set"
         case .renameSet: "Rename Set"
         case .renameIcon: "Rename Icon"
+        case .renameSmartSet: "Rename Smart Set"
+        case .editSmartSetQuery: "Edit Query"
         }
     }
 
     var confirmTitle: String {
         switch self {
         case .newSet: "Create"
-        case .renameSet, .renameIcon: "Rename"
+        case .renameSet, .renameIcon, .renameSmartSet: "Rename"
+        case .editSmartSetQuery: "Save"
         }
     }
 }

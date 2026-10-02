@@ -10,6 +10,7 @@ final class Library {
     private(set) var sets: [IconSet] = []
     private(set) var icons: [Icon] = []
     private(set) var licenses = License.starters
+    private(set) var smartSets: [SmartSet] = []
 
     // MARK: Window state
     // One window, so what it shows lives here rather than in a second object that the menu
@@ -89,6 +90,10 @@ final class Library {
     @ObservationIgnored
     private var cachedCounts: (icons: [Icon], sets: [IconSet], bySet: [UUID: Int])?
     @ObservationIgnored private var cachedVisible: (key: VisibleKey, icons: [Icon])?
+    @ObservationIgnored
+    private var cachedTagCounts: (icons: [Icon], counts: [(tag: String, count: Int)])?
+    @ObservationIgnored private var cachedSmartCounts:
+        (icons: [Icon], sets: [IconSet], smartSets: [SmartSet], bySet: [UUID: Int])?
 
     /// Changes when the library is moved or switched in Settings.
     private(set) var folder: URL
@@ -122,10 +127,11 @@ final class Library {
         // Where the window left off, with anything pointing at a set that has gone dropped.
         let known = Set(sets.map(\.id))
         let rememberedSidebar = preferences.sidebarItem.flatMap(SidebarItem.init(stored:))
-        if case .set(let id) = rememberedSidebar, !known.contains(id) {
-            sidebar = .all
-        } else {
-            sidebar = rememberedSidebar ?? .all
+        sidebar = switch rememberedSidebar {
+        case .set(let id) where !known.contains(id): .all
+        case .smart(let id) where !smartSets.contains(where: { $0.id == id }): .all
+        case let item?: item
+        case nil: .all
         }
         expandedSets = Set(preferences.expandedSetIDs.compactMap(UUID.init(uuidString:)))
             .intersection(known)
@@ -149,6 +155,8 @@ final class Library {
         var icons: [Icon]
         /// Optional: libraries saved before licences existed start with the starter set.
         var licenses: [License]?
+        /// Optional, like licenses: libraries from before smart sets still decode.
+        var smartSets: [SmartSet]?
     }
 
     private func load() {
@@ -178,6 +186,7 @@ final class Library {
             sets = index.sets
             icons = index.icons
             licenses = index.licenses ?? License.starters
+            smartSets = index.smartSets ?? []
             repairSetTree()
         } catch {
             // Set an unreadable index aside before anything saves an empty library over it.
@@ -231,7 +240,9 @@ final class Library {
         encoder.dateEncodingStrategy = .iso8601
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            let data = try encoder.encode(Index(sets: sets, icons: icons, licenses: licenses))
+            let data = try encoder.encode(
+                Index(sets: sets, icons: icons, licenses: licenses, smartSets: smartSets)
+            )
             try data.write(to: indexURL, options: .atomic)
         } catch {
             notice = Notice(
@@ -295,6 +306,21 @@ final class Library {
             )
         case .set(let id):
             sortedIcons.filter(isInside(id))
+        case .tag(let tag):
+            sortedIcons.filter { $0.tags.contains(tag) }
+        case .smart(let id):
+            matching(smartSets.first { $0.id == id }?.query ?? "")
+        }
+    }
+
+    /// A smart set's icons: its saved query run over the whole library, across every field, so
+    /// what it finds doesn't swing with the search scope in Settings.
+    private func matching(_ query: String) -> [Icon] {
+        guard !query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
+        let paths = Dictionary(uniqueKeysWithValues: setPaths.map { ($0.set.id, $0.path) })
+        let scope = SearchScope(tags: true, setNames: true, descriptions: true)
+        return sortedIcons.filter {
+            iconMatches($0, query: query, setPath: paths[$0.setID] ?? "", scope: scope)
         }
     }
 
@@ -347,7 +373,36 @@ final class Library {
         case .starred: icons.count(where: \.starred)
         case .recent: min(icons.count { $0.lastUsed != nil }, preferences.recentLimit)
         case .set(let id): setCounts[id] ?? 0
+        case .tag(let tag): tagCounts.first { $0.tag == tag }?.count ?? 0
+        case .smart(let id): smartCounts[id] ?? 0
         }
+    }
+
+    /// Every tag in the library with how many icons carry it, in name order, cached like the
+    /// set counts so the sidebar never rebuilds it per row.
+    var tagCounts: [(tag: String, count: Int)] {
+        if let cachedTagCounts, cachedTagCounts.icons == icons { return cachedTagCounts.counts }
+        var histogram: [String: Int] = [:]
+        for icon in icons {
+            for tag in icon.tags { histogram[tag, default: 0] += 1 }
+        }
+        let counts = histogram
+            .sorted { $0.key.localizedStandardCompare($1.key) == .orderedAscending }
+            .map { (tag: $0.key, count: $0.value) }
+        cachedTagCounts = (icons, counts)
+        return counts
+    }
+
+    private var smartCounts: [UUID: Int] {
+        if let cachedSmartCounts, cachedSmartCounts.icons == icons,
+           cachedSmartCounts.sets == sets, cachedSmartCounts.smartSets == smartSets {
+            return cachedSmartCounts.bySet
+        }
+        let bySet = Dictionary(
+            uniqueKeysWithValues: smartSets.map { ($0.id, matching($0.query).count) }
+        )
+        cachedSmartCounts = (icons, sets, smartSets, bySet)
+        return bySet
     }
 
     /// Every set's count, nested sets' icons included, worked out for all of them at once rather
@@ -376,6 +431,7 @@ final class Library {
         var descending: Bool
         var recentLimit: Int
         var scope: SearchScope
+        var smartSets: [SmartSet]
     }
 
     var visibleIcons: [Icon] {
@@ -386,7 +442,7 @@ final class Library {
         let key = VisibleKey(
             icons: icons, sets: sets, sidebar: sidebar, searchText: searchText,
             sort: preferences.sort, descending: preferences.sortDescending,
-            recentLimit: preferences.recentLimit, scope: scope
+            recentLimit: preferences.recentLimit, scope: scope, smartSets: smartSets
         )
         if let cachedVisible, cachedVisible.key == key { return cachedVisible.icons }
         var shown = icons(in: sidebar)
@@ -415,6 +471,8 @@ final class Library {
         case .recent: "Recently Used"
         case .starred: "Starred"
         case .set(let id): sets.first { $0.id == id }?.name ?? "Set"
+        case .smart(let id): smartSets.first { $0.id == id }?.name ?? "Smart Set"
+        case .tag(let tag): tag
         }
     }
 
@@ -578,6 +636,56 @@ final class Library {
         naming = .renameIcon(icon.id)
     }
 
+    // MARK: Smart sets
+
+    /// Saves what's in the search field as a smart set named after it, and shows it.
+    func saveSearchAsSmartSet() {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return }
+        let smart = SmartSet(name: query, query: query)
+        recording("New Smart Set") {
+            smartSets.append(smart)
+            save()
+        }
+        searchText = ""
+        sidebar = .smart(smart.id)
+    }
+
+    func beginRename(_ smart: SmartSet) {
+        draftName = smart.name
+        naming = .renameSmartSet(smart.id)
+    }
+
+    func beginEditQuery(_ smart: SmartSet) {
+        draftName = smart.query
+        naming = .editSmartSetQuery(smart.id)
+    }
+
+    func renameSmartSet(_ id: UUID, to name: String) {
+        guard let index = smartSets.firstIndex(where: { $0.id == id }) else { return }
+        recording("Rename Smart Set") {
+            smartSets[index].name = name
+            save()
+        }
+    }
+
+    func editSmartSetQuery(_ id: UUID, to query: String) {
+        guard let index = smartSets.firstIndex(where: { $0.id == id }) else { return }
+        recording("Edit Query") {
+            smartSets[index].query = query
+            save()
+        }
+    }
+
+    /// No confirmation: it holds nothing but its query, and undo brings it back.
+    func deleteSmartSet(_ id: UUID) {
+        recording("Delete Smart Set") {
+            smartSets.removeAll { $0.id == id }
+            save()
+        }
+        if sidebar == .smart(id) { sidebar = .all }
+    }
+
     func finishNaming(_ naming: Naming) {
         let name = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
@@ -585,6 +693,8 @@ final class Library {
         case .newSet(let parent): sidebar = .set(createSet(named: name, inside: parent).id)
         case .renameSet(let id): renameSet(id, to: name)
         case .renameIcon(let id): rename(id, to: name)
+        case .renameSmartSet(let id): renameSmartSet(id, to: name)
+        case .editSmartSetQuery(let id): editSmartSetQuery(id, to: name)
         }
     }
 
@@ -659,7 +769,10 @@ final class Library {
         var icons: [Icon] = []
         var sets: [IconSet] = []
         var licenses: [License] = []
-        var isEmpty: Bool { icons.isEmpty && sets.isEmpty && licenses.isEmpty }
+        var smartSets: [SmartSet] = []
+        var isEmpty: Bool {
+            icons.isEmpty && sets.isEmpty && licenses.isEmpty && smartSets.isEmpty
+        }
     }
 
     /// Runs `change` and registers what it did with the undo manager, worked out by diffing the
@@ -671,12 +784,13 @@ final class Library {
         guard !isRecording else { return try change() }
         isRecording = true
         defer { isRecording = false }
-        let (icons0, sets0, licenses0) = (icons, sets, licenses)
+        let (icons0, sets0, licenses0, smart0) = (icons, sets, licenses, smartSets)
         let result = try change()
         var step = Step(name: name)
         diff(icons0, icons, into: &step.before.icons, &step.after.icons)
         diff(sets0, sets, into: &step.before.sets, &step.after.sets)
         diff(licenses0, licenses, into: &step.before.licenses, &step.after.licenses)
+        diff(smart0, smartSets, into: &step.before.smartSets, &step.after.smartSets)
         guard !(step.before.isEmpty && step.after.isEmpty) else { return result }
         // Files of icons the action removed go to the Trash rather than away.
         let kept = Set(icons.map(\.id))
@@ -761,6 +875,18 @@ final class Library {
                 licenses[index] = license
             } else {
                 licenses.append(license)
+            }
+        }
+
+        let goneSmart = Set(counterpart.smartSets.map(\.id))
+            .subtracting(restored.smartSets.map(\.id))
+        smartSets.removeAll { goneSmart.contains($0.id) }
+        if case .smart(let id) = sidebar, goneSmart.contains(id) { sidebar = .all }
+        for smart in restored.smartSets {
+            if let index = smartSets.firstIndex(where: { $0.id == smart.id }) {
+                smartSets[index] = smart
+            } else {
+                smartSets.append(smart)
             }
         }
 

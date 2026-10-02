@@ -2,6 +2,8 @@ import SwiftUI
 
 struct SidebarView: View {
     @Environment(Library.self) private var library
+    /// The tag list can dwarf the sets, so whether it's open is remembered.
+    @AppStorage("sidebarShowsTags") private var showsTags = true
 
     var body: some View {
         @Bindable var library = library
@@ -15,8 +17,35 @@ struct SidebarView: View {
                     }
                 row("Starred", symbol: "star", item: .starred)
             }
+            if !library.smartSets.isEmpty {
+                Section("Smart Sets") {
+                    ForEach(library.smartSets) { smart in
+                        Label(smart.name, systemImage: "folder.badge.gearshape")
+                            .badge(library.count(in: .smart(smart.id)))
+                            .tag(SidebarItem.smart(smart.id))
+                            .contextMenu {
+                                Button("Rename…") { library.beginRename(smart) }
+                                Button("Edit Query…") { library.beginEditQuery(smart) }
+                                Button("Delete Smart Set", role: .destructive) {
+                                    library.deleteSmartSet(smart.id)
+                                }
+                            }
+                            .help(smart.query)
+                    }
+                }
+            }
             Section("Sets") {
                 ForEach(library.children(of: nil)) { SetTree(set: $0) }
+            }
+            let tags = library.tagCounts
+            if !tags.isEmpty {
+                Section("Tags", isExpanded: $showsTags) {
+                    ForEach(tags, id: \.tag) { entry in
+                        Label(entry.tag, systemImage: "tag")
+                            .badge(entry.count)
+                            .tag(SidebarItem.tag(entry.tag))
+                    }
+                }
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {

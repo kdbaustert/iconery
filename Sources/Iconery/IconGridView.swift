@@ -179,6 +179,13 @@ struct IconGridView: View {
                         "Nothing Used Yet", systemImage: "clock",
                         description: Text("Icons you export or drag out of the grid show up here.")
                     )
+                case .smart:
+                    ContentUnavailableView(
+                        "No Matches", systemImage: "folder.badge.gearshape",
+                        description: Text("No icons match this smart set's query.")
+                    )
+                case .tag:
+                    ContentUnavailableView("No Icons With This Tag", systemImage: "tag")
                 default:
                     ContentUnavailableView(
                         "Empty Set", systemImage: "folder",

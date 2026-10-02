@@ -590,6 +590,51 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
+    func testSmartSetsTagRowsAndFieldPrefixes() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let set = library.createSet(named: "Lucide")
+        library.importItems(
+            [
+                try writeSVG("arrow-left", #"<path d="M1 1h4"/>"#),
+                try writePNG("banana"),
+            ], into: set.id
+        )
+        let arrow = try XCTUnwrap(library.icons.first { $0.name == "arrow-left" })
+        library.addTags([arrow.id], ["navigation"])
+
+        // A word can name its field, whatever the scope says.
+        func matches(_ icon: Icon, _ query: String) -> Bool {
+            iconMatches(icon, query: query, setPath: "Lucide", scope: SearchScope())
+        }
+        let banana = try XCTUnwrap(library.icons.first { $0.name == "banana" })
+        XCTAssertTrue(matches(library.icons[0], "kind:svg") != matches(banana, "kind:svg"))
+        XCTAssertTrue(matches(try XCTUnwrap(library.icons.first { $0.id == arrow.id }), "tag:nav"))
+        XCTAssertFalse(matches(banana, "tag:nav"))
+        XCTAssertTrue(matches(banana, "set:lucide"))
+        XCTAssertFalse(matches(banana, "arrow"))
+
+        // The tag row shows just its icons.
+        XCTAssertEqual(library.tagCounts.map(\.tag), ["navigation"])
+        XCTAssertEqual(library.icons(in: .tag("navigation")).map(\.id), [arrow.id])
+        XCTAssertEqual(library.count(in: .tag("navigation")), 1)
+
+        // A saved search becomes a sidebar item run against the live library.
+        library.searchText = "kind:svg"
+        library.saveSearchAsSmartSet()
+        let smart = try XCTUnwrap(library.smartSets.first)
+        XCTAssertEqual(library.sidebar, .smart(smart.id))
+        XCTAssertTrue(library.searchText.isEmpty, "the search moved into the smart set")
+        XCTAssertEqual(library.icons(in: .smart(smart.id)).map(\.id), [arrow.id])
+        XCTAssertEqual(library.count(in: .smart(smart.id)), 1)
+        library.importItems([try writeSVG("circle", #"<circle r="4"/>"#)], into: set.id)
+        XCTAssertEqual(library.count(in: .smart(smart.id)), 2, "live: new icons join it")
+
+        library.deleteSmartSet(smart.id)
+        XCTAssertTrue(library.smartSets.isEmpty)
+        XCTAssertEqual(library.sidebar, .all, "the deleted smart set was showing")
+    }
+
+    @MainActor
     func testUndoRestoresEditsDeletionsAndImports() throws {
         let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let undo = UndoManager()

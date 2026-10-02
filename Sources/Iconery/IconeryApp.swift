@@ -36,6 +36,10 @@ struct IconeryApp: App {
                 }
                 .keyboardShortcut("n", modifiers: [.command, .option])
                 .disabled(library.currentSetID == nil)
+                Button("Save Search as Smart Set") { library.saveSearchAsSmartSet() }
+                    .disabled(
+                        library.searchText.trimmingCharacters(in: .whitespaces).isEmpty
+                    )
             }
             // The selection's commands, so they exist in the menu bar and not only on
             // right-click. Copy lives in Edit and lights up through the grid's onCopyCommand.
