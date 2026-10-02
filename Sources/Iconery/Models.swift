@@ -182,6 +182,6 @@ struct Notice {
     var message: String
 }
 
-func plural(_ count: Int, _ noun: String) -> String {
-    "\(count) \(noun)\(count == 1 ? "" : "s")"
+func plural(_ count: Int, _ noun: String, _ many: String? = nil) -> String {
+    "\(count) \(count == 1 ? noun : many ?? noun + "s")"
 }

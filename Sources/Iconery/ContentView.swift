@@ -57,6 +57,7 @@ struct ContentView: View {
         } message: { deletion in
             Text(deletion.message)
         }
+        .sheet(isPresented: isPresent(\.check)) { CheckResultsView() }
         .alert(
             library.notice?.title ?? "", isPresented: isPresent(\.notice),
             presenting: library.notice
@@ -75,6 +76,71 @@ struct ContentView: View {
             get: { library[keyPath: keyPath] != nil },
             set: { if !$0 { library[keyPath: keyPath] = nil } }
         )
+    }
+}
+
+/// What Check Library found, with one fix per section. Each fix empties its section, so what
+/// remains to do stays in front of you.
+private struct CheckResultsView: View {
+    @Environment(Library.self) private var library
+
+    var body: some View {
+        let check = library.check ?? .init()
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Library Check")
+                .font(.title3.bold())
+            if check.isClean {
+                Label("Nothing to fix. Every record has its file, every file its record, and no "
+                      + "two icons share one content.", systemImage: "checkmark.seal")
+            }
+            if !check.duplicateGroups.isEmpty {
+                section(
+                    "\(plural(check.duplicateGroups.count, "group")) of identical icons",
+                    names: check.duplicateGroups.map {
+                        "\($0.first?.name ?? "") (\(plural($0.count, "copy", "copies")))"
+                    },
+                    fix: "Delete Duplicates, Keeping the Oldest",
+                    action: library.deleteDuplicates
+                )
+            }
+            if !check.missing.isEmpty {
+                section(
+                    "\(plural(check.missing.count, "icon")) missing their files",
+                    names: check.missing.map(\.name),
+                    fix: "Remove Their Records",
+                    action: library.removeMissingRecords
+                )
+            }
+            if !check.orphans.isEmpty {
+                section(
+                    "\(plural(check.orphans.count, "file")) no icon record names",
+                    names: check.orphans.map(\.lastPathComponent),
+                    fix: "Move Them to the Trash",
+                    action: library.trashOrphans
+                )
+            }
+            HStack {
+                Spacer()
+                Button("Done") { library.check = nil }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+    }
+
+    private func section(
+        _ title: String, names: [String], fix: String, action: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.headline)
+            let shown = names.prefix(6).joined(separator: "\n")
+                + (names.count > 6 ? "\n…and \(names.count - 6) more" : "")
+            Text(shown)
+                .foregroundStyle(.secondary)
+                .font(.callout)
+            Button(fix, action: action)
+        }
     }
 }
 

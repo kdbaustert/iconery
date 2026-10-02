@@ -1054,6 +1054,102 @@ final class Library {
         selection = Set(visibleIcons.map(\.id))
     }
 
+    // MARK: Check Library
+
+    /// What a check found: icons sharing one file content, records whose files are gone, and
+    /// files in the icons folder no record names. Presented as a sheet while non-nil.
+    struct LibraryCheck: Sendable {
+        var duplicateGroups: [[Icon]] = []
+        var missing: [Icon] = []
+        var orphans: [URL] = []
+        var isClean: Bool { duplicateGroups.isEmpty && missing.isEmpty && orphans.isEmpty }
+    }
+
+    var check: LibraryCheck?
+    private(set) var isChecking = false
+
+    /// Reads and hashes every same-sized pair of files, so it runs off the main actor and only
+    /// when asked: the import-time duplicate check never sees what came before it or through an
+    /// IconJar import.
+    func checkLibrary() async {
+        guard !isChecking else { return }
+        isChecking = true
+        let snapshot = icons
+        let folder = iconsFolder
+        check = await Task.detached(priority: .userInitiated) {
+            Self.scan(icons: snapshot, folder: folder)
+        }.value
+        isChecking = false
+    }
+
+    private nonisolated static func scan(icons: [Icon], folder: URL) -> LibraryCheck {
+        var check = LibraryCheck()
+        let manager = FileManager.default
+        var bySize: [Int: [(icon: Icon, url: URL)]] = [:]
+        for icon in icons {
+            let url = folder.appending(path: icon.fileName)
+            guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else {
+                check.missing.append(icon)
+                continue
+            }
+            bySize[size, default: []].append((icon, url))
+        }
+        for group in bySize.values where group.count > 1 {
+            var byHash: [Data: [Icon]] = [:]
+            for entry in group {
+                guard let data = try? Data(contentsOf: entry.url) else { continue }
+                byHash[Data(SHA256.hash(data: data)), default: []].append(entry.icon)
+            }
+            for dupes in byHash.values where dupes.count > 1 {
+                // Oldest first, so "keep the oldest" keeps the original.
+                check.duplicateGroups.append(dupes.sorted { $0.added < $1.added })
+            }
+        }
+        check.duplicateGroups.sort {
+            ($0.first?.name ?? "").localizedStandardCompare($1.first?.name ?? "")
+                == .orderedAscending
+        }
+        check.missing.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let known = Set(icons.map(\.fileName))
+        let contents = (try? manager.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: nil, options: .skipsHiddenFiles
+        )) ?? []
+        check.orphans = contents
+            .filter { !known.contains($0.lastPathComponent) && !$0.hasDirectoryPath }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return check
+    }
+
+    /// Keeps the oldest of each group and deletes the rest, as one undoable step.
+    func deleteDuplicates() {
+        let extras = (check?.duplicateGroups ?? []).flatMap { $0.dropFirst() }.map(\.id)
+        guard !extras.isEmpty else { return }
+        recording("Delete Duplicates") {
+            removeIcons(Set(extras))
+            save()
+        }
+        check?.duplicateGroups = []
+    }
+
+    /// Drops the records whose files are gone; there is nothing left to show for them.
+    func removeMissingRecords() {
+        let gone = check?.missing ?? []
+        guard !gone.isEmpty else { return }
+        recording("Remove Missing Icons") {
+            removeIcons(Set(gone.map(\.id)))
+            save()
+        }
+        check?.missing = []
+    }
+
+    /// Files no record names go to the Trash, like any other file an edit removes.
+    func trashOrphans() {
+        for url in check?.orphans ?? [] {
+            try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
+        check?.orphans = []
+    }
+
     // MARK: Licences
 
     @discardableResult

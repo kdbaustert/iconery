@@ -71,6 +71,8 @@ struct IconeryApp: App {
                     .disabled(library.selection.isEmpty || !library.canExport)
                 Divider()
                 Button("Back Up Library Now") { library.backUpNow() }
+                Button("Check Library…") { Task { await library.checkLibrary() } }
+                    .disabled(library.isChecking)
             }
         }
     }

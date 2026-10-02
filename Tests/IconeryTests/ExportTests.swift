@@ -590,6 +590,46 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
+    func testCheckLibraryFindsDuplicatesMissingFilesAndOrphans() async throws {
+        // Duplicates have to get in, so import-time skipping is off.
+        let preferences = preferences { $0.skipsDuplicates = false }
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)
+        let set = library.createSet(named: "Set")
+        let body = #"<path d="M3 10l9-7 9 7"/>"#
+        let original = try writeSVG("house", body)
+        let copy = folder.appending(path: "house copy.svg")
+        try FileManager.default.copyItem(at: original, to: copy)
+        library.importItems([original, copy, try writeSVG("solo", #"<circle r="5"/>"#)], into: set.id)
+        XCTAssertEqual(library.icons.count, 3)
+
+        // One icon loses its file; one stray file appears beside the others.
+        let lost = try XCTUnwrap(library.icons.first { $0.name == "solo" })
+        let iconsFolder = library.fileURL(for: lost).deletingLastPathComponent()
+        try FileManager.default.removeItem(at: library.fileURL(for: lost))
+        let stray = iconsFolder.appending(path: "stray.svg")
+        try Data(body.utf8).write(to: stray)
+
+        await library.checkLibrary()
+        let check = try XCTUnwrap(library.check)
+        XCTAssertEqual(check.duplicateGroups.count, 1)
+        XCTAssertEqual(check.duplicateGroups.first?.count, 2)
+        XCTAssertEqual(check.missing.map(\.name), ["solo"])
+        XCTAssertEqual(check.orphans.map(\.lastPathComponent), ["stray.svg"])
+
+        library.deleteDuplicates()
+        XCTAssertEqual(library.icons.count { $0.name.hasPrefix("house") }, 1, "oldest kept")
+        library.removeMissingRecords()
+        XCTAssertFalse(library.icons.contains { $0.name == "solo" })
+        library.trashOrphans()
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: stray.path(percentEncoded: false))
+        )
+
+        await library.checkLibrary()
+        XCTAssertEqual(library.check?.isClean, true)
+    }
+
+    @MainActor
     func testSmartSetsTagRowsAndFieldPrefixes() throws {
         let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let set = library.createSet(named: "Lucide")
