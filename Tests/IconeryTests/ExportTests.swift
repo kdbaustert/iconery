@@ -590,6 +590,37 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
+    func testKeyboardSelectionExtendsAndTypesAhead() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let set = library.createSet(named: "Set")
+        library.importItems(
+            [
+                try writeSVG("apple", #"<path d="M1 1h4"/>"#),
+                try writeSVG("banana", #"<path d="M2 1h4"/>"#),
+                try writeSVG("cherry", #"<path d="M3 1h4"/>"#),
+            ], into: set.id
+        )
+        func chosen() -> [String] { library.selectedIcons.map(\.name) }
+
+        XCTAssertEqual(library.moveSelection(by: 1), library.visibleIcons.first?.id)
+        XCTAssertEqual(chosen(), ["apple"], "nothing selected: the first icon")
+        _ = library.moveSelection(by: 1, extending: true)
+        XCTAssertEqual(chosen(), ["apple", "banana"])
+        _ = library.moveSelection(by: 1, extending: true)
+        XCTAssertEqual(chosen(), ["apple", "banana", "cherry"])
+        _ = library.moveSelection(by: -1, extending: true)
+        XCTAssertEqual(chosen(), ["apple", "banana"], "stepping back shrinks the range")
+        _ = library.selectEnd(true)
+        XCTAssertEqual(chosen(), ["cherry"])
+        _ = library.selectEnd(false, extending: true)
+        XCTAssertEqual(chosen(), ["apple", "banana", "cherry"], "Home with ⇧ reaches the top")
+        _ = library.typeToSelect("b")
+        XCTAssertEqual(chosen(), ["banana"])
+        _ = library.typeToSelect("a")
+        XCTAssertEqual(chosen(), ["banana"], "a second letter joins the prefix: 'ba'")
+    }
+
+    @MainActor
     func testRecentlyUsedKeepsAsManyAsSettingsSay() throws {
         let preferences = preferences { $0.recentLimit = 25 }
         let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)

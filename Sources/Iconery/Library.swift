@@ -61,6 +61,11 @@ final class Library {
     }
 
     @ObservationIgnored private var anchor: UUID?
+    /// The keyboard caret: the moving end of a ⇧-arrow range, where the anchor is the fixed one.
+    @ObservationIgnored private var focusID: UUID?
+    /// Type-to-select's prefix so far, and when it starts over.
+    @ObservationIgnored private var typeAhead = ""
+    @ObservationIgnored private var typeAheadExpiry = Date.distantPast
     @ObservationIgnored private var draggingIDs: Set<UUID>?
     /// Each dragged icon's Recently Used date from before the drag stamped it, so a drop that
     /// turns out to be a move inside the app can put it back.
@@ -503,6 +508,7 @@ final class Library {
     // MARK: Selection
 
     func click(_ id: UUID, in visible: [Icon], modifiers: NSEvent.ModifierFlags) {
+        focusID = id
         if modifiers.contains(.command) {
             if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
             anchor = id
@@ -681,23 +687,60 @@ final class Library {
         guard let index = visible.firstIndex(where: { $0.id == id }),
               visible.indices.contains(index + offset)
         else { return }
-        selection = [visible[index + offset].id]
-        anchor = visible[index + offset].id
+        settle(on: visible[index + offset].id, in: visible, extending: false)
     }
 
     /// The grid's arrow keys: from the icon last clicked, or the first icon when none is
     /// selected. Returns the icon selected, for the grid to scroll to.
     @discardableResult
-    func moveSelection(by offset: Int) -> UUID? {
-        let current = anchor.flatMap { selection.contains($0) ? $0 : nil }
+    func moveSelection(by offset: Int, extending: Bool = false) -> UUID? {
+        let visible = visibleIcons
+        let current = focusID.flatMap { selection.contains($0) ? $0 : nil }
+            ?? anchor.flatMap { selection.contains($0) ? $0 : nil }
             ?? selectedIcons.first?.id
-        if let current {
-            selectNeighbour(of: current, by: offset)
-        } else if let first = visibleIcons.first {
-            selection = [first.id]
-            anchor = first.id
+        guard let current, let index = visible.firstIndex(where: { $0.id == current }) else {
+            guard let first = visible.first?.id else { return nil }
+            settle(on: first, in: visible, extending: false)
+            return first
         }
-        return anchor
+        guard visible.indices.contains(index + offset) else { return current }
+        let next = visible[index + offset].id
+        settle(on: next, in: visible, extending: extending)
+        return next
+    }
+
+    /// Home and End: the first or last icon, or everything from the anchor to it with ⇧ held.
+    func selectEnd(_ last: Bool, extending: Bool = false) -> UUID? {
+        let visible = visibleIcons
+        guard let target = (last ? visible.last : visible.first)?.id else { return nil }
+        settle(on: target, in: visible, extending: extending)
+        return target
+    }
+
+    /// Finder's type-to-select: letters typed within a second join into a prefix, and the first
+    /// icon whose name starts with it is selected.
+    func typeToSelect(_ characters: String) -> UUID? {
+        let now = Date()
+        typeAhead = (now < typeAheadExpiry ? typeAhead : "") + characters.lowercased()
+        typeAheadExpiry = now.addingTimeInterval(1)
+        let visible = visibleIcons
+        guard let match = visible.first(where: { $0.name.lowercased().hasPrefix(typeAhead) })
+        else { return nil }
+        settle(on: match.id, in: visible, extending: false)
+        return match.id
+    }
+
+    /// Moves the keyboard caret to `target`: extending selects the anchor through the caret, as
+    /// Finder does; otherwise the selection becomes the caret alone and anchors there.
+    private func settle(on target: UUID, in visible: [Icon], extending: Bool) {
+        focusID = target
+        if extending, let anchor, let from = visible.firstIndex(where: { $0.id == anchor }),
+           let to = visible.firstIndex(where: { $0.id == target }) {
+            selection = Set(visible[min(from, to)...max(from, to)].map(\.id))
+        } else {
+            selection = [target]
+            anchor = target
+        }
     }
 
     func selectAll() {

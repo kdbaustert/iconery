@@ -104,7 +104,23 @@ struct IconGridView: View {
             case .upArrow: -columns
             default: columns
             }
-            keyedID = library.moveSelection(by: offset)
+            keyedID = library.moveSelection(
+                by: offset, extending: press.modifiers.contains(.shift)
+            )
+            return .handled
+        }
+        .onKeyPress(keys: [.home, .end]) { press in
+            keyedID = library.selectEnd(
+                press.key == .end, extending: press.modifiers.contains(.shift)
+            )
+            return .handled
+        }
+        // Finder's type-to-select: typing letters jumps to the first matching name.
+        .onKeyPress(characters: .alphanumerics) { press in
+            guard press.modifiers.isDisjoint(with: [.command, .option, .control]),
+                  let id = library.typeToSelect(press.characters)
+            else { return .ignored }
+            keyedID = id
             return .handled
         }
         // Escape is the exit command on macOS.
