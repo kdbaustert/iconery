@@ -143,12 +143,14 @@ enum Deletion {
     var message: String {
         switch self {
         case .set(_, let iconCount, 0):
-            "Its \(plural(iconCount, "icon")) leave the library with it. This can't be undone."
+            "Its \(plural(iconCount, "icon")) leave the library with it. Undo brings them back; "
+                + "their files wait in the Trash."
         case .set(_, let iconCount, let setCount):
             "The \(plural(setCount, "set")) inside it and \(plural(iconCount, "icon")) leave the "
-                + "library with it. This can't be undone."
+                + "library with it. Undo brings them back; the files wait in the Trash."
         case .icons:
-            "They leave the library. The files you imported them from are not touched."
+            "Their files here move to the Trash, and Undo brings them back. The files you "
+                + "imported them from are not touched."
         }
     }
 }

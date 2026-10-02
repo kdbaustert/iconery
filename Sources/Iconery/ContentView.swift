@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(Library.self) private var library
+    @Environment(\.undoManager) private var undoManager
     @State private var showsInspector = true
 
     var body: some View {
@@ -34,6 +35,10 @@ struct ContentView: View {
                 }
         }
         .onChange(of: library.sidebar) { library.selection = [] }
+        // The window's undo manager, so Edit ▸ Undo reaches the library while text fields
+        // keep their own.
+        .onAppear { library.undoManager = undoManager }
+        .onChange(of: undoManager) { library.undoManager = undoManager }
         .task { await library.runBackupSchedule() }
         .alert(
             library.naming?.title ?? "", isPresented: isPresent(\.naming),

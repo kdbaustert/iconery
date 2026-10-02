@@ -590,6 +590,64 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
+    func testUndoRestoresEditsDeletionsAndImports() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let undo = UndoManager()
+        // One group per action, opened by hand: the implicit per-event grouping needs a run
+        // loop, and a test turn has none.
+        undo.groupsByEvent = false
+        library.undoManager = undo
+        func grouped<T>(_ body: () throws -> T) rethrows -> T {
+            undo.beginUndoGrouping()
+            defer { undo.endUndoGrouping() }
+            return try body()
+        }
+        func exists(_ url: URL) -> Bool {
+            FileManager.default.fileExists(atPath: url.path(percentEncoded: false))
+        }
+
+        let set = grouped { library.createSet(named: "Set") }
+        let home = try writeSVG("home", #"<path d="M3 10l9-7 9 7"/>"#)
+        grouped { library.importItems([home], into: set.id) }
+        let icon = try XCTUnwrap(library.icons.first)
+        let file = library.fileURL(for: icon)
+
+        grouped { library.rename(icon.id, to: "hut") }
+        XCTAssertEqual(undo.undoActionName, "Rename")
+        undo.undo()
+        XCTAssertEqual(library.icons.first?.name, "home")
+        undo.redo()
+        XCTAssertEqual(library.icons.first?.name, "hut")
+
+        XCTAssertTrue(exists(file))
+        grouped { library.perform(.icons([icon.id])) }
+        XCTAssertTrue(library.icons.isEmpty, "deleted")
+        XCTAssertFalse(exists(file), "its file went to the Trash")
+        undo.undo()
+        XCTAssertEqual(library.icons.first?.name, "hut", "undo brings the icon back")
+        XCTAssertTrue(exists(file), "and its file with it")
+
+        // Undoing an import takes the copies out of the library; redo returns them.
+        undo.undo()  // the rename, back to "home", so the import is next on the stack
+        undo.undo()
+        XCTAssertTrue(library.icons.isEmpty, "the import is undone")
+        XCTAssertFalse(exists(file))
+        undo.redo()
+        XCTAssertEqual(library.icons.first?.name, "home")
+        XCTAssertTrue(exists(file))
+
+        // Deleting the set takes the tree and its icons; undo rebuilds it whole.
+        let kept = try XCTUnwrap(library.sets.first)
+        grouped { library.perform(.set(kept, iconCount: 1, setCount: 0)) }
+        XCTAssertTrue(library.sets.isEmpty)
+        XCTAssertTrue(library.icons.isEmpty)
+        undo.undo()
+        XCTAssertEqual(library.sets.first?.name, "Set")
+        XCTAssertEqual(library.icons.first?.name, "home")
+        XCTAssertTrue(exists(file))
+    }
+
+    @MainActor
     func testKeyboardSelectionExtendsAndTypesAhead() throws {
         let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let set = library.createSet(named: "Set")

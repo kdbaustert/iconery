@@ -152,6 +152,8 @@ final class Library {
     }
 
     private func load() {
+        // A different library's past is not this one's to undo.
+        undoManager?.removeAllActions()
         indexUnreadable = false
         let data: Data
         do {
@@ -526,9 +528,11 @@ final class Library {
 
     @discardableResult
     func createSet(named name: String, inside parent: UUID? = nil) -> IconSet {
-        let set = makeSet(named: name, inside: parent)
-        save()
-        return set
+        recording("New Set") {
+            let set = makeSet(named: name, inside: parent)
+            save()
+            return set
+        }
     }
 
     /// Adds a set without saving, for an import that creates many and saves once at the end.
@@ -541,8 +545,10 @@ final class Library {
 
     func renameSet(_ id: UUID, to name: String) {
         guard let index = sets.firstIndex(where: { $0.id == id }) else { return }
-        sets[index].name = name
-        save()
+        recording("Rename Set") {
+            sets[index].name = name
+            save()
+        }
     }
 
     /// Moves a set, with everything inside it, under `parent`, or to the top level when nil. A set
@@ -550,9 +556,11 @@ final class Library {
     func moveSet(_ id: UUID, into parent: UUID?) {
         if let parent, subtree(of: id).contains(parent) { return }
         guard let index = sets.firstIndex(where: { $0.id == id }) else { return }
-        sets[index].parentID = parent
-        if let parent { expandedSets.insert(parent) }
-        save()
+        recording("Move Set") {
+            sets[index].parentID = parent
+            if let parent { expandedSets.insert(parent) }
+            save()
+        }
     }
 
     func beginNewSet(inside parent: UUID? = nil) {
@@ -587,17 +595,20 @@ final class Library {
     }
 
     func perform(_ deletion: Deletion) {
-        switch deletion {
-        case .set(let set, _, _):
-            let tree = subtree(of: set.id)
-            removeIcons(Set(icons.filter { tree.contains($0.setID) }.map(\.id)))
-            sets.removeAll { tree.contains($0.id) }
-            expandedSets.subtract(tree)
-            if let current = currentSetID, tree.contains(current) { sidebar = .all }
-        case .icons(let ids):
-            removeIcons(ids)
+        let name = if case .set = deletion { "Delete Set" } else { "Delete" }
+        recording(name) {
+            switch deletion {
+            case .set(let set, _, _):
+                let tree = subtree(of: set.id)
+                removeIcons(Set(icons.filter { tree.contains($0.setID) }.map(\.id)))
+                sets.removeAll { tree.contains($0.id) }
+                expandedSets.subtract(tree)
+                if let current = currentSetID, tree.contains(current) { sidebar = .all }
+            case .icons(let ids):
+                removeIcons(ids)
+            }
+            save()
         }
-        save()
     }
 
     /// Asks first, unless Settings says not to.
@@ -610,9 +621,8 @@ final class Library {
     }
 
     private func removeIcons(_ ids: Set<UUID>) {
-        for icon in icons where ids.contains(icon.id) {
-            try? FileManager.default.removeItem(at: fileURL(for: icon))
-        }
+        // No file deletion here: every removal runs inside recording(), which moves the files
+        // of icons that leave the library to the Trash so undo can bring them back.
         icons.removeAll { ids.contains($0.id) }
         selection.subtract(ids)
     }
@@ -626,6 +636,160 @@ final class Library {
         return "\(name) \(number)"
     }
 
+    // MARK: Undo
+
+    /// The window's undo manager, handed over by ContentView, so Edit ▸ Undo reaches the
+    /// library when the grid has focus and text fields keep their own. Nil in tests until a
+    /// test brings one.
+    @ObservationIgnored var undoManager: UndoManager?
+    @ObservationIgnored private var isRecording = false
+
+    /// What one action changed, as only the items it touched: `before` holds them as they were
+    /// (the changed and the removed), `after` as they became (the changed and the added). Undo
+    /// puts `before` back and removes what only `after` has; redo the reverse. Files of removed
+    /// icons sit in the Trash meanwhile, under `trashed`, keyed by icon id.
+    private struct Step: Sendable {
+        var name: String
+        var before = Delta()
+        var after = Delta()
+        var trashed: [UUID: URL] = [:]
+    }
+
+    private struct Delta: Sendable {
+        var icons: [Icon] = []
+        var sets: [IconSet] = []
+        var licenses: [License] = []
+        var isEmpty: Bool { icons.isEmpty && sets.isEmpty && licenses.isEmpty }
+    }
+
+    /// Runs `change` and registers what it did with the undo manager, worked out by diffing the
+    /// library around it, so a caller never lists what it touched. Reentrant calls, like the
+    /// set a folder import creates, fold into the outermost step. Recently Used stamps happen
+    /// outside any recording on purpose: a drag or copy is not an edit to undo.
+    @discardableResult
+    private func recording<T>(_ name: String, _ change: () throws -> T) rethrows -> T {
+        guard !isRecording else { return try change() }
+        isRecording = true
+        defer { isRecording = false }
+        let (icons0, sets0, licenses0) = (icons, sets, licenses)
+        let result = try change()
+        var step = Step(name: name)
+        diff(icons0, icons, into: &step.before.icons, &step.after.icons)
+        diff(sets0, sets, into: &step.before.sets, &step.after.sets)
+        diff(licenses0, licenses, into: &step.before.licenses, &step.after.licenses)
+        guard !(step.before.isEmpty && step.after.isEmpty) else { return result }
+        // Files of icons the action removed go to the Trash rather than away.
+        let kept = Set(icons.map(\.id))
+        trashFiles(of: step.before.icons.filter { !kept.contains($0.id) }, into: &step.trashed)
+        register(step, undoing: true)
+        return result
+    }
+
+    /// Items only or different in `old` land in `before`; only or different in `new`, `after`.
+    private func diff<Item: Identifiable & Equatable>(
+        _ old: [Item], _ new: [Item], into before: inout [Item], _ after: inout [Item]
+    ) {
+        if old == new { return }  // still sharing storage: nothing to walk
+        let newByID = Dictionary(uniqueKeysWithValues: new.map { ($0.id, $0) })
+        let oldByID = Dictionary(uniqueKeysWithValues: old.map { ($0.id, $0) })
+        before = old.filter { newByID[$0.id] != $0 }
+        after = new.filter { oldByID[$0.id] != $0 }
+    }
+
+    private func register(_ step: Step, undoing: Bool) {
+        guard let undoManager else { return }
+        undoManager.registerUndo(withTarget: self) { target in
+            // Undo always arrives on the main thread in an AppKit app.
+            MainActor.assumeIsolated { target.apply(step, undoing: undoing) }
+        }
+        undoManager.setActionName(step.name)
+    }
+
+    /// One direction of a step: what the direction adds is removed (files to the Trash), and
+    /// what it had is put back (files out of the Trash). Registering the reverse lands it on
+    /// the other of the undo manager's two stacks.
+    private func apply(_ step: Step, undoing: Bool) {
+        var step = step
+        let restored = undoing ? step.before : step.after
+        let counterpart = undoing ? step.after : step.before
+
+        let restoredIconIDs = Set(restored.icons.map(\.id))
+        let goneIcons = Set(counterpart.icons.map(\.id)).subtracting(restoredIconIDs)
+        trashFiles(of: icons.filter { goneIcons.contains($0.id) }, into: &step.trashed)
+        icons.removeAll { goneIcons.contains($0.id) }
+        selection.subtract(goneIcons)
+
+        let present = Set(icons.map(\.id))
+        var missing: [String] = []
+        for icon in restored.icons {
+            if !present.contains(icon.id) {
+                let file = fileURL(for: icon)
+                if let away = step.trashed.removeValue(forKey: icon.id) {
+                    do { try FileManager.default.moveItem(at: away, to: file) } catch {
+                        missing.append(icon.name)
+                    }
+                } else if !FileManager.default.fileExists(
+                    atPath: file.path(percentEncoded: false)
+                ) {
+                    missing.append(icon.name)
+                }
+            }
+            if let index = icons.firstIndex(where: { $0.id == icon.id }) {
+                icons[index] = icon
+            } else {
+                icons.append(icon)
+            }
+        }
+
+        let goneSets = Set(counterpart.sets.map(\.id)).subtracting(restored.sets.map(\.id))
+        sets.removeAll { goneSets.contains($0.id) }
+        expandedSets.subtract(goneSets)
+        if case .set(let id) = sidebar, goneSets.contains(id) { sidebar = .all }
+        for set in restored.sets {
+            if let index = sets.firstIndex(where: { $0.id == set.id }) {
+                sets[index] = set
+            } else {
+                sets.append(set)
+            }
+        }
+
+        let goneLicenses = Set(counterpart.licenses.map(\.id))
+            .subtracting(restored.licenses.map(\.id))
+        licenses.removeAll { goneLicenses.contains($0.id) }
+        for license in restored.licenses {
+            if let index = licenses.firstIndex(where: { $0.id == license.id }) {
+                licenses[index] = license
+            } else {
+                licenses.append(license)
+            }
+        }
+
+        if !missing.isEmpty {
+            notice = Notice(
+                title: "Some icons came back without their files",
+                message: "Their files are no longer in the Trash:\n" + Self.listed(missing)
+            )
+        }
+        save()
+        register(step, undoing: !undoing)
+    }
+
+    /// Moves the icons' library files to the Trash, keeping where each landed so they can come
+    /// back. A volume without a Trash falls back to deleting, and such an icon would return
+    /// fileless.
+    private func trashFiles(of icons: [Icon], into trashed: inout [UUID: URL]) {
+        for icon in icons {
+            let url = fileURL(for: icon)
+            var landed: NSURL?
+            do {
+                try FileManager.default.trashItem(at: url, resultingItemURL: &landed)
+                if let landed { trashed[icon.id] = landed as URL }
+            } catch {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
     // MARK: Icons
 
     func update(_ ids: Set<UUID>, _ change: (inout Icon) -> Void) {
@@ -636,7 +800,7 @@ final class Library {
     }
 
     func move(_ ids: Set<UUID>, to setID: UUID) {
-        update(ids) { $0.setID = setID }
+        recording("Move to Set") { update(ids) { $0.setID = setID } }
     }
 
     /// Whether the menu bar offers Unstar: only when every selected icon is starred.
@@ -646,18 +810,20 @@ final class Library {
     }
 
     func clearRecents() {
-        update(Set(icons.filter { $0.lastUsed != nil }.map(\.id))) { $0.lastUsed = nil }
+        recording("Clear Recently Used") {
+            update(Set(icons.filter { $0.lastUsed != nil }.map(\.id))) { $0.lastUsed = nil }
+        }
     }
 
     func toggleStar(_ ids: Set<UUID>) {
         let star = !icons.filter { ids.contains($0.id) }.allSatisfy(\.starred)
-        update(ids) { $0.starred = star }
+        recording(star ? "Star" : "Unstar") { update(ids) { $0.starred = star } }
     }
 
     func rename(_ id: UUID, to name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        update([id]) { $0.name = name }
+        recording("Rename") { update([id]) { $0.name = name } }
         revealed = id
     }
 
@@ -665,16 +831,16 @@ final class Library {
         let tags = tags.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         // The tag field reports whenever it loses focus, changed or not.
         guard icons.first(where: { $0.id == id })?.tags != tags else { return }
-        update([id]) { $0.tags = tags }
+        recording("Change Tags") { update([id]) { $0.tags = tags } }
     }
 
     func setInfo(_ id: UUID, _ text: String) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        update([id]) { $0.info = text.isEmpty ? nil : text }
+        recording("Change Description") { update([id]) { $0.info = text.isEmpty ? nil : text } }
     }
 
     func setLicense(_ ids: Set<UUID>, _ licenseID: UUID?) {
-        update(ids) { $0.licenseID = licenseID }
+        recording("Change License") { update(ids) { $0.licenseID = licenseID } }
     }
 
     func license(of icon: Icon) -> License? {
@@ -751,25 +917,31 @@ final class Library {
 
     @discardableResult
     func addLicense() -> License {
-        let license = License(name: "New License", url: "")
-        licenses.append(license)
-        save()
-        return license
+        recording("Add License") {
+            let license = License(name: "New License", url: "")
+            licenses.append(license)
+            save()
+            return license
+        }
     }
 
     func updateLicense(_ license: License) {
         guard let index = licenses.firstIndex(where: { $0.id == license.id }) else { return }
-        licenses[index] = license
-        save()
+        recording("Change License") {
+            licenses[index] = license
+            save()
+        }
     }
 
     /// Icons that carried the licence go back to having none.
     func removeLicense(_ id: UUID) {
-        licenses.removeAll { $0.id == id }
-        for index in icons.indices where icons[index].licenseID == id {
-            icons[index].licenseID = nil
+        recording("Remove License") {
+            licenses.removeAll { $0.id == id }
+            for index in icons.indices where icons[index].licenseID == id {
+                icons[index].licenseID = nil
+            }
+            save()
         }
-        save()
     }
 
     // MARK: Open In
@@ -838,6 +1010,10 @@ final class Library {
     /// go into `target`, or into "Unsorted" when no set is selected.
     @discardableResult
     func importItems(_ urls: [URL], into target: UUID?) -> ImportReport {
+        recording("Import") { importItemsNow(urls, into: target) }
+    }
+
+    private func importItemsNow(_ urls: [URL], into target: UUID?) -> ImportReport {
         var report = ImportReport()
         duplicates = preferences.skipsDuplicates ? DuplicateFinder(files: icons.map(fileURL)) : nil
         defer { duplicates = nil }
@@ -970,9 +1146,11 @@ final class Library {
         // app never reports back. Filing icons into a set isn't using them, so put the old
         // dates back along with the move.
         let before = draggedLastUsed
-        update(ids) {
-            $0.setID = setID
-            if let old = before[$0.id] { $0.lastUsed = old }
+        recording("Move to Set") {
+            update(ids) {
+                $0.setID = setID
+                if let old = before[$0.id] { $0.lastUsed = old }
+            }
         }
         return true
     }
@@ -1077,6 +1255,10 @@ final class Library {
     /// identifier, so importing the same library again adds only what is new since.
     @discardableResult
     func importIconJar(_ library: URL, into target: UUID?) throws -> ImportReport {
+        try recording("Import") { try importIconJarNow(library, into: target) }
+    }
+
+    private func importIconJarNow(_ library: URL, into target: UUID?) throws -> ImportReport {
         let jar = try IconJarLibrary.read(library)
         var report = ImportReport()
         report.incomplete = jar.incompleteItems
