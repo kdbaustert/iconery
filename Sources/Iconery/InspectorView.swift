@@ -77,10 +77,14 @@ private struct PreviewHeader: View {
             }
             Spacer()
             ControlGroup {
-                Button { step(-1) } label: { Image(systemName: "chevron.left") }
-                    .disabled(!canStep(-1))
-                Button { step(1) } label: { Image(systemName: "chevron.right") }
-                    .disabled(!canStep(1))
+                Button { step(-1) } label: {
+                    Label("Previous", systemImage: "chevron.left").labelStyle(.iconOnly)
+                }
+                .disabled(!canStep(-1))
+                Button { step(1) } label: {
+                    Label("Next", systemImage: "chevron.right").labelStyle(.iconOnly)
+                }
+                .disabled(!canStep(1))
             }
             .fixedSize()
             .help(count > 1 ? "Previous or next selected icon" : "Previous or next icon")
@@ -162,10 +166,12 @@ private struct ExportBar: View {
             Spacer(minLength: 0)
             FillSwatch(fill: $library.export.fill)
                 .disabled(!options.format.isBitmap)
-            Button { showsOptions = true } label: { Image(systemName: "slider.horizontal.3") }
-                .buttonStyle(.borderless)
-                .help("File names, background and quality")
-                .popover(isPresented: $showsOptions) { ExportOptionsForm() }
+            Button { showsOptions = true } label: {
+                Label("Export Options", systemImage: "slider.horizontal.3").labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .help("File names, background and quality")
+            .popover(isPresented: $showsOptions) { ExportOptionsForm() }
         }
         .padding(6)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
@@ -230,6 +236,7 @@ private struct FillSwatch: View {
         }
         .buttonStyle(.plain)
         .help(fill == nil ? "Icon Fill: none" : "Icon Fill")
+        .accessibilityLabel(fill == nil ? "Icon Fill: none" : "Icon Fill")
         .popover(isPresented: $isPicking) { FillPicker(fill: $fill) }
     }
 }
@@ -237,20 +244,20 @@ private struct FillSwatch: View {
 private struct FillPicker: View {
     @Binding var fill: ExportColor?
 
-    /// Apple's system colors, plus black, grey and white.
-    private static let presets = [
-        ExportColor(red: 0, green: 0, blue: 0),
-        ExportColor(red: 0.56, green: 0.56, blue: 0.58),
-        .white,
-        ExportColor(red: 1, green: 0.23, blue: 0.19),
-        ExportColor(red: 1, green: 0.58, blue: 0),
-        ExportColor(red: 1, green: 0.8, blue: 0),
-        ExportColor(red: 0.2, green: 0.78, blue: 0.35),
-        ExportColor(red: 0.19, green: 0.69, blue: 0.78),
-        ExportColor(red: 0, green: 0.48, blue: 1),
-        ExportColor(red: 0.35, green: 0.34, blue: 0.84),
-        ExportColor(red: 0.69, green: 0.32, blue: 0.87),
-        ExportColor(red: 1, green: 0.18, blue: 0.33),
+    /// Apple's system colors, plus black, grey and white. Named for VoiceOver.
+    private static let presets: [(name: String, color: ExportColor)] = [
+        ("Black", ExportColor(red: 0, green: 0, blue: 0)),
+        ("Grey", ExportColor(red: 0.56, green: 0.56, blue: 0.58)),
+        ("White", .white),
+        ("Red", ExportColor(red: 1, green: 0.23, blue: 0.19)),
+        ("Orange", ExportColor(red: 1, green: 0.58, blue: 0)),
+        ("Yellow", ExportColor(red: 1, green: 0.8, blue: 0)),
+        ("Green", ExportColor(red: 0.2, green: 0.78, blue: 0.35)),
+        ("Teal", ExportColor(red: 0.19, green: 0.69, blue: 0.78)),
+        ("Blue", ExportColor(red: 0, green: 0.48, blue: 1)),
+        ("Indigo", ExportColor(red: 0.35, green: 0.34, blue: 0.84)),
+        ("Purple", ExportColor(red: 0.69, green: 0.32, blue: 0.87)),
+        ("Pink", ExportColor(red: 1, green: 0.18, blue: 0.33)),
     ]
 
     var body: some View {
@@ -258,7 +265,7 @@ private struct FillPicker: View {
             Text("Icon Fill").font(.headline)
             let columns = Array(repeating: GridItem(.fixed(24), spacing: 6), count: 6)
             LazyVGrid(columns: columns, spacing: 6) {
-                ForEach(Self.presets, id: \.self) { color in
+                ForEach(Self.presets, id: \.color) { name, color in
                     Button { fill = color } label: {
                         RoundedRectangle(cornerRadius: 5)
                             .fill(color.color)
@@ -271,6 +278,9 @@ private struct FillPicker: View {
                             }
                     }
                     .buttonStyle(.plain)
+                    .help(name)
+                    .accessibilityLabel(name)
+                    .accessibilityAddTraits(fill == color ? .isSelected : [])
                 }
             }
             ColorPicker(
@@ -476,8 +486,11 @@ private struct DetailsFields: View {
                 Text(current?.name ?? "No License").lineLimit(1)
             }
             if let link {
-                Link(destination: link) { Image(systemName: "arrow.up.right.square") }
-                    .help(link.absoluteString)
+                Link(destination: link) {
+                    Label("Open License", systemImage: "arrow.up.right.square")
+                        .labelStyle(.iconOnly)
+                }
+                .help(link.absoluteString)
             }
         }
     }
@@ -629,10 +642,10 @@ private struct ManageLicensesSheet: View {
             HStack {
                 ControlGroup {
                     Button { selection = library.addLicense().id } label: {
-                        Image(systemName: "plus")
+                        Label("Add License", systemImage: "plus").labelStyle(.iconOnly)
                     }
                     Button { if let selection { library.removeLicense(selection) } } label: {
-                        Image(systemName: "minus")
+                        Label("Remove License", systemImage: "minus").labelStyle(.iconOnly)
                     }
                     .disabled(selection == nil)
                 }
@@ -697,8 +710,11 @@ private struct CommitField: View {
             .onDisappear(perform: save)
     }
 
+    /// Back to the saved value afterwards: a change that's kept arrives as a new `value` straight
+    /// after, and one turned down, like an empty name, would otherwise stay on screen as if saved.
     private func save() {
         if draft != value { commit(draft) }
+        draft = value
     }
 }
 

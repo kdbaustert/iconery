@@ -9,6 +9,18 @@ set -euo pipefail
 cd "$(dirname "$0")"
 APP="build/Iconery.app"
 
+# Checked before anything builds, so a mistyped --install fails rather than quietly not installing.
+INSTALL=0
+for arg in "$@"; do
+    case "$arg" in
+        --install) INSTALL=1 ;;
+        *)
+            echo "==> ERROR: unknown option \"$arg\" (the only one is --install)" >&2
+            exit 1
+            ;;
+    esac
+done
+
 echo "==> Compiling"
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)/Iconery"
@@ -22,12 +34,14 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 # The icon, compiled as Xcode does it: Assets.car, read through CFBundleIconName, plus AppIcon.icns
 # for anything older. The catalog's PNGs come from Resources/Icon/make-icon.sh.
 echo "==> Compiling icon"
+PARTIAL="$(mktemp -d)"
+trap 'rm -rf "$PARTIAL"' EXIT
 xcrun actool Resources/Assets.xcassets \
     --compile "$APP/Contents/Resources" \
     --platform macosx \
     --minimum-deployment-target 14.0 \
     --app-icon AppIcon \
-    --output-partial-info-plist "$(mktemp -d)/partial.plist" >/dev/null
+    --output-partial-info-plist "$PARTIAL/partial.plist" >/dev/null
 if [[ ! -f "$APP/Contents/Resources/Assets.car" ]]; then
     echo "==> ERROR: actool did not produce Assets.car" >&2
     exit 1
@@ -37,10 +51,13 @@ fi
 # that grant to the app's designated requirement. A stable certificate keeps the requirement the
 # same build to build; ad-hoc ties it to the code hash, so every rebuild would ask again. Cmd-Tab's
 # self-signed certificate, as DockIt used before it had its own. No `grep -q`: under pipefail an
-# early exit can SIGPIPE `security` and fail the check.
+# early exit can SIGPIPE `security` and fail the check. -v lists only identities codesign will
+# accept, so an expired certificate falls back to ad-hoc rather than failing at codesign. A name is
+# matched in its quotes, so a longer name containing it doesn't pass; a hash between spaces.
 IDENTITY="${CODESIGN_IDENTITY:-Cmd-Tab Local}"
 if [[ "$IDENTITY" != "-" ]] \
-    && ! security find-identity -p codesigning | grep -F -- "$IDENTITY" >/dev/null; then
+    && ! security find-identity -v -p codesigning \
+        | grep -F -e "\"$IDENTITY\"" -e " $IDENTITY " >/dev/null; then
     if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
         echo "==> ERROR: \"$IDENTITY\" is not a code signing identity in the keychain" >&2
         exit 1
@@ -54,7 +71,7 @@ codesign --verify --strict "$APP"
 
 echo "==> Built $APP"
 
-if [[ "${1:-}" == "--install" ]]; then
+if [[ "$INSTALL" == 1 ]]; then
     echo "==> Installing to /Applications"
     osascript -e 'quit app "Iconery"' 2>/dev/null || true
     for _ in $(seq 1 30); do

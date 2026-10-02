@@ -56,6 +56,8 @@ struct IconJarLibrary {
     var groups: [Group] = []
     var collections: [Collection] = []
     var items: [Item] = []
+    /// Icons whose record has no file name or no set, so they can't be found or placed.
+    var incompleteItems = 0
 
     /// IconJar's own library type, a package. Looked up by identifier: on this Mac,
     /// `UTType(filenameExtension: "ijlibrary")` returned a dynamic, non-package type (measured),
@@ -124,7 +126,10 @@ struct IconJarLibrary {
             db, "SELECT ZUUID, ZNAME, ZNEWFILENAME, ZTAGSSTRING, ZSTARRED, ZDATE, ZLASTUSEDDATE, "
                 + "ZCOLLECTION, ZTYPE FROM ZIJITEM"
         ) { row in
-            guard let file = row.text(2), let collection = row.int(7) else { return }
+            guard let file = row.text(2), let collection = row.int(7) else {
+                jar.incompleteItems += 1
+                return
+            }
             jar.items.append(Item(
                 uuid: row.text(0) ?? "",
                 name: row.text(1),

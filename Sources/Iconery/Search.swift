@@ -1,7 +1,7 @@
 import Foundation
 
 /// Which fields search looks at besides the name, which it always does.
-struct SearchScope {
+struct SearchScope: Equatable {
     var tags = true
     var setNames = false
     var descriptions = false

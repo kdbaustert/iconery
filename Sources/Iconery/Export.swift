@@ -304,18 +304,28 @@ enum SVGCleaner {
             svg = svg.replacing(#/<!--[\s\S]*?-->/#, with: "")
         }
         if options.removesSize { svg = withoutSize(svg) }
-        if options.compresses {
-            svg = svg.replacing(#/>\s+</#, with: "><")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
+        if options.compresses { svg = compressed(svg) }
         return svg
+    }
+
+    /// Whitespace between tags is only layout, except inside <text>, where the space between two
+    /// <tspan>s is the space between two words. A text element is matched whole and kept as it is,
+    /// so its insides are never looked at; only the whitespace around it goes.
+    private static func compressed(_ svg: String) -> String {
+        svg.replacing(#/(<text\b[\s\S]*?<\/text>)\s*|>\s+(?=<)/#) { match in
+            match.output.1.map(String.init) ?? ">"
+        }
+        .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Drops width and height from the root <svg>, so it scales to whatever holds it. A file with
     /// no viewBox gets one from them first, or the drawing would lose its proportions; when they
     /// aren't plain numbers it is left alone.
     private static func withoutSize(_ svg: String) -> String {
-        guard let root = svg.firstMatch(of: #/<svg\b[^>]*>/#) else { return svg }
+        // Comments are matched too, so an "<svg" written inside one is passed over, and quoted
+        // values whole, so a ">" inside one doesn't end the tag.
+        let tags = svg.matches(of: #/<!--[\s\S]*?-->|<svg\b(?:[^>"']|"[^"]*"|'[^']*')*>/#)
+        guard let root = tags.first(where: { $0.output.hasPrefix("<svg") }) else { return svg }
         var tag = String(root.output)
         if attribute("viewBox", in: tag) == nil {
             guard let width = attribute("width", in: tag).flatMap(number),
@@ -486,12 +496,17 @@ enum Exporter {
     }
 
     /// "/" and ":" cannot appear in a macOS file name, and a leading dot would hide the file.
+    /// Control characters become spaces, and the name stops at 200 bytes: APFS allows 255, which
+    /// leaves room for a size, a " 2" and an extension added after.
     static func safeFileName(_ name: String) -> String {
         var cleaned = name
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
+            .components(separatedBy: CharacterSet(charactersIn: "\u{0}"..."\u{1F}"))
+            .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         while cleaned.hasPrefix(".") { cleaned.removeFirst() }
+        while cleaned.utf8.count > 200 { cleaned.removeLast() }
         return cleaned.isEmpty ? "icon" : cleaned
     }
 

@@ -29,7 +29,29 @@ final class Library {
     var naming: Naming?
     var draftName = ""
     var pendingDeletion: Deletion?
-    var notice: Notice?
+
+    /// Alerts waiting their turn, oldest first. Two IconJar libraries dropped together, or a
+    /// scheduled backup failing while another alert is up, each get shown rather than the last one
+    /// replacing the rest.
+    private var notices: [Notice] = []
+
+    /// The alert showing now. Setting one queues it behind any already waiting; setting nil, as
+    /// dismissing the alert does, moves on to the next.
+    var notice: Notice? {
+        get { notices.first }
+        set {
+            if let newValue {
+                notices.append(newValue)
+                return
+            }
+            guard !notices.isEmpty else { return }
+            let waiting = notices.dropFirst()
+            notices = []
+            // A turn of the run loop later, so the closing alert has gone before the next opens.
+            guard !waiting.isEmpty else { return }
+            Task { notices.insert(contentsOf: waiting, at: min(1, notices.count)) }
+        }
+    }
 
     @ObservationIgnored private var anchor: UUID?
     @ObservationIgnored private var draggingIDs: Set<UUID>?
@@ -37,6 +59,20 @@ final class Library {
     private let thumbnails = NSCache<NSString, CGImage>()
     /// nil inside means "looked, and it isn't one colour", so it is never worked out twice.
     @ObservationIgnored private var singleColors: [String: SIMD3<Double>?] = [:]
+    /// Set when library.json is there but can't be read, so nothing saves an empty library over it.
+    @ObservationIgnored private var indexUnreadable = false
+    /// Why the last scheduled backup failed, kept until one succeeds.
+    @ObservationIgnored private var lastScheduledFailure: String?
+
+    // What the views would otherwise work out again on every redraw: one sort of a 9,000-icon
+    // library takes 28 ms (measured), and a click used to run three. Each is kept with what it was
+    // made from and rebuilt when that differs. An array still sharing storage with the kept one
+    // compares equal without looking at its elements, so an unchanged library costs nothing.
+    @ObservationIgnored private var cachedTree: (sets: [IconSet], children: [UUID?: [IconSet]])?
+    @ObservationIgnored private var cachedOrder: (icons: [Icon], sort: GridSort, sorted: [Icon])?
+    @ObservationIgnored
+    private var cachedCounts: (icons: [Icon], sets: [IconSet], bySet: [UUID: Int])?
+    @ObservationIgnored private var cachedVisible: (key: VisibleKey, icons: [Icon])?
 
     /// Changes when the library is moved or switched in Settings.
     private(set) var folder: URL
@@ -57,6 +93,10 @@ final class Library {
     /// their own `preferences`.
     init(folder: URL? = nil, preferences: Preferences = .shared) {
         self.preferences = preferences
+        // Without limits these only shed under memory pressure, and a 256 pt grid keeps a 1 MB
+        // thumbnail per icon scrolled past.
+        thumbnails.totalCostLimit = 256 * 1024 * 1024
+        images.countLimit = 500
         exportFolder = Self.storedURL(Self.exportKey)
         let remembered = Self.storedURL(Self.libraryKey)
         self.folder = folder ?? remembered ?? Self.defaultFolder
@@ -86,7 +126,23 @@ final class Library {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: indexURL) else { return }
+        indexUnreadable = false
+        let data: Data
+        do {
+            data = try Data(contentsOf: indexURL)
+        } catch CocoaError.fileReadNoSuchFile {
+            return  // a new library
+        } catch {
+            // There but unreadable: a drive that dropped off, an iCloud file not yet downloaded, a
+            // permissions change. The next save would write an empty library over it.
+            indexUnreadable = true
+            notice = Notice(
+                title: "The library could not be read",
+                message: "Changes won't be saved until it can be, so nothing is lost. Quit and "
+                    + "open Iconery again once it's available. \(error.localizedDescription)"
+            )
+            return
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         do {
@@ -94,25 +150,54 @@ final class Library {
             sets = index.sets
             icons = index.icons
             licenses = index.licenses ?? License.starters
-            // A set whose parent is gone would never be drawn; lift it to the top level instead.
-            let ids = Set(sets.map(\.id))
-            for i in sets.indices where sets[i].parentID.map({ !ids.contains($0) }) == true {
-                sets[i].parentID = nil
-            }
+            repairSetTree()
         } catch {
             // Set an unreadable index aside before anything saves an empty library over it.
             let stamp = Int(Date().timeIntervalSince1970)
             let aside = folder.appending(path: "library-unreadable-\(stamp).json")
-            try? FileManager.default.moveItem(at: indexURL, to: aside)
-            notice = Notice(
-                title: "The library could not be read",
-                message: "It was moved to \(aside.path(percentEncoded: false)) and an empty "
-                    + "library opened in its place. \(error.localizedDescription)"
-            )
+            do {
+                try FileManager.default.moveItem(at: indexURL, to: aside)
+                notice = Notice(
+                    title: "The library could not be read",
+                    message: "It was moved to \(aside.path(percentEncoded: false)) and an empty "
+                        + "library opened in its place. \(error.localizedDescription)"
+                )
+            } catch let moveError {
+                indexUnreadable = true
+                notice = Notice(
+                    title: "The library could not be read",
+                    message: "Changes won't be saved, so nothing is written over it. "
+                        + "\(error.localizedDescription) \(moveError.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    /// Makes every set reachable from the top level, or it would never be drawn: a set whose
+    /// parent is gone is lifted to the top, and so is the set that closes a loop of parents
+    /// (A inside B inside A), which only a damaged or hand-edited file could hold.
+    private func repairSetTree() {
+        let ids = Set(sets.map(\.id))
+        for i in sets.indices where sets[i].parentID.map({ !ids.contains($0) }) == true {
+            sets[i].parentID = nil
+        }
+        var parents = Dictionary(sets.map { ($0.id, $0.parentID) }) { first, _ in first }
+        for i in sets.indices {
+            var seen: Set<UUID> = []
+            var current = sets[i].parentID
+            while let id = current, seen.insert(id).inserted {
+                if id == sets[i].id {
+                    sets[i].parentID = nil
+                    parents.updateValue(nil, forKey: id)
+                    break
+                }
+                current = parents[id] ?? nil
+            }
         }
     }
 
     private func save() {
+        guard !indexUnreadable else { return }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
@@ -130,8 +215,13 @@ final class Library {
     // MARK: Queries
 
     func children(of parent: UUID?) -> [IconSet] {
-        sets.filter { $0.parentID == parent }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        if cachedTree?.sets != sets {
+            let children = Dictionary(grouping: sets, by: \.parentID).mapValues {
+                $0.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            }
+            cachedTree = (sets, children)
+        }
+        return cachedTree?.children[parent] ?? []
     }
 
     /// Every set, depth first, with its full path ("UI › Arrows") for menus and pickers, where a
@@ -154,8 +244,8 @@ final class Library {
         var result: Set<UUID> = [id]
         var pending = [id]
         while let current = pending.popLast() {
-            for child in sets where child.parentID == current {
-                result.insert(child.id)
+            // Only sets not seen yet, so even a loop of parents comes to an end.
+            for child in children(of: current) where result.insert(child.id).inserted {
                 pending.append(child.id)
             }
         }
@@ -166,9 +256,9 @@ final class Library {
     func icons(in item: SidebarItem?) -> [Icon] {
         switch item {
         case .all, nil:
-            sorted(icons)
+            sortedIcons
         case .starred:
-            sorted(icons.filter(\.starred))
+            sortedIcons.filter(\.starred)
         case .recent:
             Array(
                 icons.filter { $0.lastUsed != nil }
@@ -176,8 +266,20 @@ final class Library {
                     .prefix(preferences.recentLimit)
             )
         case .set(let id):
-            sorted(icons.filter(isInside(id)))
+            sortedIcons.filter(isInside(id))
         }
+    }
+
+    /// The whole library in the grid's order. Filtering this keeps the order, so nothing sorts
+    /// again until an icon or the order in Settings changes.
+    private var sortedIcons: [Icon] {
+        let sort = preferences.sort
+        if let cachedOrder, cachedOrder.sort == sort, cachedOrder.icons == icons {
+            return cachedOrder.sorted
+        }
+        let result = sorted(icons)
+        cachedOrder = (icons, sort, result)
+        return result
     }
 
     /// In the order Settings ▸ General picks. Date Added puts the newest first.
@@ -205,25 +307,60 @@ final class Library {
         case .all: icons.count
         case .starred: icons.count(where: \.starred)
         case .recent: min(icons.count { $0.lastUsed != nil }, preferences.recentLimit)
-        case .set(let id): icons.count(where: isInside(id))
+        case .set(let id): setCounts[id] ?? 0
         }
     }
 
+    /// Every set's count, nested sets' icons included, worked out for all of them at once rather
+    /// than with a walk of the library per sidebar row.
+    private var setCounts: [UUID: Int] {
+        if let cachedCounts, cachedCounts.icons == icons, cachedCounts.sets == sets {
+            return cachedCounts.bySet
+        }
+        var own: [UUID: Int] = [:]
+        for icon in icons { own[icon.setID, default: 0] += 1 }
+        var bySet: [UUID: Int] = [:]
+        for set in sets {
+            bySet[set.id] = subtree(of: set.id).reduce(0) { $0 + own[$1, default: 0] }
+        }
+        cachedCounts = (icons, sets, bySet)
+        return bySet
+    }
+
+    /// Everything the grid's contents depend on.
+    private struct VisibleKey: Equatable {
+        var icons: [Icon]
+        var sets: [IconSet]
+        var sidebar: SidebarItem?
+        var searchText: String
+        var sort: GridSort
+        var recentLimit: Int
+        var scope: SearchScope
+    }
+
     var visibleIcons: [Icon] {
-        let shown = icons(in: sidebar)
-        guard !searchText.trimmingCharacters(in: .whitespaces).isEmpty else { return shown }
-        let paths = Dictionary(uniqueKeysWithValues: setPaths.map { ($0.set.id, $0.path) })
         let scope = SearchScope(
             tags: preferences.searchesTags, setNames: preferences.searchesSetNames,
             descriptions: preferences.searchesDescriptions
         )
-        return shown.filter {
-            iconMatches($0, query: searchText, setPath: paths[$0.setID] ?? "", scope: scope)
+        let key = VisibleKey(
+            icons: icons, sets: sets, sidebar: sidebar, searchText: searchText,
+            sort: preferences.sort, recentLimit: preferences.recentLimit, scope: scope
+        )
+        if let cachedVisible, cachedVisible.key == key { return cachedVisible.icons }
+        var shown = icons(in: sidebar)
+        if !searchText.trimmingCharacters(in: .whitespaces).isEmpty {
+            let paths = Dictionary(uniqueKeysWithValues: setPaths.map { ($0.set.id, $0.path) })
+            shown = shown.filter {
+                iconMatches($0, query: searchText, setPath: paths[$0.setID] ?? "", scope: scope)
+            }
         }
+        cachedVisible = (key, shown)
+        return shown
     }
 
     var selectedIcons: [Icon] {
-        sorted(icons.filter { selection.contains($0.id) })
+        sortedIcons.filter { selection.contains($0.id) }
     }
 
     var currentSetID: UUID? {
@@ -280,7 +417,7 @@ final class Library {
             return nil
         }
         if let fix, let tinted = Raster.tinted(raster, fix) { raster = tinted }
-        thumbnails.setObject(raster, forKey: key)
+        thumbnails.setObject(raster, forKey: key, cost: raster.bytesPerRow * raster.height)
         return raster
     }
 
@@ -469,6 +606,8 @@ final class Library {
 
     func setTags(_ id: UUID, _ tags: [String]) {
         let tags = tags.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        // The tag field reports whenever it loses focus, changed or not.
+        guard icons.first(where: { $0.id == id })?.tags != tags else { return }
         update([id]) { $0.tags = tags }
     }
 
@@ -492,6 +631,26 @@ final class Library {
               visible.indices.contains(index + offset)
         else { return }
         selection = [visible[index + offset].id]
+        anchor = visible[index + offset].id
+    }
+
+    /// The grid's arrow keys: from the icon last clicked, or the first icon when none is
+    /// selected. Returns the icon selected, for the grid to scroll to.
+    @discardableResult
+    func moveSelection(by offset: Int) -> UUID? {
+        let current = anchor.flatMap { selection.contains($0) ? $0 : nil }
+            ?? selectedIcons.first?.id
+        if let current {
+            selectNeighbour(of: current, by: offset)
+        } else if let first = visibleIcons.first {
+            selection = [first.id]
+            anchor = first.id
+        }
+        return anchor
+    }
+
+    func selectAll() {
+        selection = Set(visibleIcons.map(\.id))
     }
 
     // MARK: Licences
@@ -558,6 +717,8 @@ final class Library {
         var skipped: [String] = []
         /// Files left out because the library already had them.
         var duplicates = 0
+        /// IconJar icons left out because its records of them lack a file or a set.
+        var incomplete = 0
         /// The sets folders became at the top of the import, then every set it made.
         var createdSets: [UUID] = []
         var allCreated: [UUID] = []
@@ -701,14 +862,15 @@ final class Library {
     }
 
     private func add(_ url: URL, to setID: UUID, report: inout ImportReport) {
+        // Duplicates first: checking one reads the file at most, and decoding it costs more.
+        if IconKind(url: url) != nil, duplicates?.contains(url) == true {
+            report.duplicates += 1
+            return
+        }
         guard let kind = IconKind(url: url), let image = NSImage(contentsOf: url),
               image.isValid, image.size.width > 0, image.size.height > 0
         else {
             report.skipped.append(url.lastPathComponent)
-            return
-        }
-        if duplicates?.contains(url) == true {
-            report.duplicates += 1
             return
         }
         let stem = url.deletingPathExtension().lastPathComponent
@@ -777,6 +939,10 @@ final class Library {
         do {
             let report = try importIconJar(library, into: target)
             var message = "\(plural(sets.count - setsBefore, "set")) added."
+            if report.incomplete > 0 {
+                message += " \(plural(report.incomplete, "icon")) left out: IconJar's record of "
+                    + "\(report.incomplete == 1 ? "it" : "them") has no file or no set."
+            }
             if !report.skipped.isEmpty {
                 message += " Skipped what Iconery can't read:\n" + Self.listed(report.skipped)
             }
@@ -797,6 +963,7 @@ final class Library {
     func importIconJar(_ library: URL, into target: UUID?) throws -> ImportReport {
         let jar = try IconJarLibrary.read(library)
         var report = ImportReport()
+        report.incomplete = jar.incompleteItems
 
         let groups = Dictionary(jar.groups.map { ($0.key, $0) }) { first, _ in first }
         var groupSets: [Int: UUID] = [:]
@@ -826,7 +993,16 @@ final class Library {
         // the whole array each time, which is quadratic over a library of thousands.
         var added: [Icon] = []
         for item in jar.items {
-            guard let collection = collections[item.collection] else { continue }
+            guard let collection = collections[item.collection] else {
+                report.incomplete += 1
+                continue
+            }
+            // Both names come from IconJar's database. IconJar writes plain names, and a ".." in
+            // either would reach outside Sets/ to any file on the Mac.
+            guard !"\(collection.folder)/\(item.file)".split(separator: "/").contains("..") else {
+                report.skipped.append("\(item.file) (outside the library)")
+                continue
+            }
             let file = setsFolder.appending(path: collection.folder).appending(path: item.file)
             guard let kind = IconKind(url: file) ?? item.recordedKind else {
                 report.skipped.append(item.file)
@@ -867,6 +1043,11 @@ final class Library {
 
         static let backupInsideLibrary = Problem(
             errorDescription: "Backups can't be kept inside the library they back up."
+        )
+
+        /// The backup is zipping the library folder, which mustn't move or change under it.
+        static let backingUp = Problem(
+            errorDescription: "A backup is being written. Try again once it has finished."
         )
     }
 
@@ -919,6 +1100,7 @@ final class Library {
 
     /// Moves the whole library into `destination` as "Iconery Library" and carries on there.
     func moveLibrary(into destination: URL) throws {
+        guard !isBackingUp else { throw Problem.backingUp }
         guard !Self.isInside(destination, folder) else {
             throw Problem(errorDescription: "A library can't move into itself.")
         }
@@ -932,6 +1114,7 @@ final class Library {
     /// Opens the library in `url` in place of this one. A folder unzipped from a backup is one,
     /// which makes this the way to restore a backup.
     func switchLibrary(to url: URL) throws {
+        guard !isBackingUp else { throw Problem.backingUp }
         let index = url.appending(path: "library.json")
         guard FileManager.default.fileExists(atPath: index.path(percentEncoded: false)) else {
             throw Problem(
@@ -1014,12 +1197,16 @@ final class Library {
             .appending(path: "iconery-backup-\(UUID().uuidString).log")
         FileManager.default.createFile(atPath: log.path(percentEncoded: false), contents: nil)
         defer { try? FileManager.default.removeItem(at: log) }
+        // Zipped under another name and renamed once whole. A zip that stops part way is removed,
+        // and until then its name keeps it from counting as one of the backups pruning keeps.
+        let partial = url.appendingPathExtension("partial")
+        defer { try? FileManager.default.removeItem(at: partial) }
         let process = Process()
         process.executableURL = URL(filePath: "/usr/bin/ditto")
         // --keepParent puts the folder itself at the top of the archive, not its contents loose.
         process.arguments = [
             "-c", "-k", "--sequesterRsrc", "--keepParent",
-            folder.path(percentEncoded: false), url.path(percentEncoded: false),
+            folder.path(percentEncoded: false), partial.path(percentEncoded: false),
         ]
         process.standardError = try FileHandle(forWritingTo: log)
         let status = try await withCheckedThrowingContinuation {
@@ -1037,6 +1224,7 @@ final class Library {
                 errorDescription: message.isEmpty ? "ditto stopped with status \(status)." : message
             )
         }
+        try FileManager.default.moveItem(at: partial, to: url)
     }
 
     /// Moves backups in `folder` past the newest `keep` to the Trash, where they can still be
@@ -1076,12 +1264,25 @@ final class Library {
         if let lastBackup, Date.now.timeIntervalSince(lastBackup) < interval { return }
         do {
             try await backUp(into: backupFolder)
+            lastScheduledFailure = nil
         } catch {
-            notice = Notice(
-                title: "The scheduled backup could not be written",
-                message: error.localizedDescription
-            )
+            let message = error.localizedDescription
+            if alertsScheduledFailure(message) {
+                notice = Notice(
+                    title: "The scheduled backup could not be written", message: message
+                )
+            }
+            lastScheduledFailure = message
         }
+    }
+
+    /// Whether a scheduled backup that failed with `message` should raise an alert. The schedule
+    /// tries again every hour the window is open, so a backup drive left unplugged fails the same
+    /// way each time. `lastScheduledFailure` holds the previous attempt's message, or nil when it
+    /// succeeded or there was none.
+    private func alertsScheduledFailure(_ message: String) -> Bool {
+        // TODO(kenny): decide when a repeated failure is worth an alert. Until then, every one is.
+        true
     }
 
     // MARK: Export
@@ -1212,15 +1413,30 @@ final class Library {
             .appending(path: UUID().uuidString)
             .appending(path: dragged.count == 1 ? Exporter.safeFileName(icon.name) : "Icons")
         var written: [URL] = []
+        var missing: [String] = []
         for item in dragged {
-            let source = fileURL(for: item)
             // Something must always land under dragRoot, or a drop onto a set could not be told
-            // apart from an import. When the export fails, the original file travels instead.
-            let files = (try? exportFiles(for: item)) ?? [ExportFile(
-                name: "\(Exporter.safeFileName(item.name)).\(item.kind.rawValue)",
-                data: (try? Data(contentsOf: source)) ?? Data()
-            )]
+            // apart from an import. When the export fails, the original file travels instead,
+            // and when that can't be read either the icon stays behind rather than arriving as
+            // an empty file.
+            let files: [ExportFile]
+            if let exported = try? exportFiles(for: item) {
+                files = exported
+            } else if let data = try? Data(contentsOf: fileURL(for: item)) {
+                files = [ExportFile(
+                    name: "\(Exporter.safeFileName(item.name)).\(item.kind.rawValue)", data: data
+                )]
+            } else {
+                missing.append(item.name)
+                continue
+            }
             written += (try? Exporter.write(files, to: folder)) ?? []
+        }
+        if !missing.isEmpty {
+            notice = Notice(
+                title: "Some icons were left out of the drag",
+                message: "Their files are missing from the library folder:\n" + Self.listed(missing)
+            )
         }
         update(ids) { $0.lastUsed = .now }
         let payload = written.count == 1 ? written[0] : folder

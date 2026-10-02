@@ -693,6 +693,32 @@ final class ExportTests: XCTestCase {
         let fluid = #"<svg width="100%" height="100%"><path d="M1 1"/></svg>"#
         XCTAssertEqual(SVGCleaner.clean(fluid, sizeOnly), fluid,
                        "no viewBox and no numbers to make one from, so it is left alone")
+        let commented = #"<!-- was <svg width="1" height="1"> --><svg width="24" height="24">"#
+            + "</svg>"
+        XCTAssertEqual(
+            SVGCleaner.clean(commented, sizeOnly),
+            #"<!-- was <svg width="1" height="1"> --><svg viewBox="0 0 24 24"></svg>"#,
+            "the root element loses its size, not an <svg> written inside a comment"
+        )
+        let words = #"<svg viewBox="0 0 9 9"> <text><tspan>Hello</tspan> <tspan>World</tspan>"#
+            + "</text>\n</svg>"
+        XCTAssertEqual(
+            SVGCleaner.clean(words, SVGCleanup(compresses: true)),
+            #"<svg viewBox="0 0 9 9"><text><tspan>Hello</tspan> <tspan>World</tspan></text>"#
+                + "</svg>",
+            "the space between two words in a text element stays"
+        )
+    }
+
+    func testFileNamesAreSafeAndShortEnough() {
+        XCTAssertEqual(Exporter.safeFileName("a/b:c"), "a-b-c")
+        XCTAssertEqual(Exporter.safeFileName("..hidden"), "hidden")
+        XCTAssertEqual(Exporter.safeFileName("two\nlines\u{0}"), "two lines")
+        XCTAssertEqual(Exporter.safeFileName(" "), "icon")
+        // "é" is two bytes, so 300 of them are 600: cut to 200 bytes, between characters.
+        let long = Exporter.safeFileName(String(repeating: "é", count: 300))
+        XCTAssertEqual(long.utf8.count, 200)
+        XCTAssertEqual(long, String(repeating: "é", count: 100))
     }
 
     func testExportNamesFollowTheNamingSetting() {
@@ -817,6 +843,107 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
+    func testAFailedBackupLeavesNoPartOfAZip() async throws {
+        let (_, source) = try makeSVGIcon()
+        let library = Library(folder: folder.appending(path: "Library"))
+        library.importItems([source], into: nil)
+        // ditto can't read this, so it stops part way (status 1, measured) with a zip begun.
+        let file = library.fileURL(for: try XCTUnwrap(library.icons.first))
+        let path = file.path(percentEncoded: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: path)
+        let readable: [FileAttributeKey: Any] = [.posixPermissions: 0o644]
+        defer { try? FileManager.default.setAttributes(readable, ofItemAtPath: path) }
+        let backups = folder.appending(path: "Backups")
+        try FileManager.default.createDirectory(at: backups, withIntermediateDirectories: true)
+
+        do {
+            try await library.writeBackup(to: backups.appending(path: "Iconery Backup x.zip"))
+            XCTFail("the backup can't succeed without the icon")
+        } catch {}
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: backups.path()), [],
+                       "nothing is left for pruning to count as a backup")
+    }
+
+    @MainActor
+    func testAnUnreadableLibraryIsNeverSavedOver() throws {
+        let (_, source) = try makeSVGIcon()
+        let libraryFolder = folder.appending(path: "Library")
+        Library(folder: libraryFolder).importItems([source], into: nil)
+        let index = libraryFolder.appending(path: "library.json")
+        let before = try Data(contentsOf: index)
+        let path = index.path(percentEncoded: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: path)
+        let readable: [FileAttributeKey: Any] = [.posixPermissions: 0o644]
+        defer { try? FileManager.default.setAttributes(readable, ofItemAtPath: path) }
+
+        let library = Library(folder: libraryFolder)
+        XCTAssertNotNil(library.notice, "says it couldn't read the library")
+        library.createSet(named: "New")
+
+        try FileManager.default.setAttributes(readable, ofItemAtPath: path)
+        XCTAssertEqual(try Data(contentsOf: index), before, "and wrote nothing over it")
+    }
+
+    @MainActor
+    func testALoopOfParentSetsStillOpens() throws {
+        let libraryFolder = folder.appending(path: "Library")
+        try FileManager.default.createDirectory(
+            at: libraryFolder, withIntermediateDirectories: true
+        )
+        // No Iconery writes this, but a damaged or hand-edited file could: A inside B inside A.
+        let a = "3C93B1B0-C34D-42FB-AB1C-C5A93E3BB3BE"
+        let b = "5B0F3E4C-9A47-4C55-9D3B-6A8F1E2D7C10"
+        let saved = #"{"icons":[],"sets":[{"id":"\#(a)","name":"A","parentID":"\#(b)"},"#
+            + #"{"id":"\#(b)","name":"B","parentID":"\#(a)"}]}"#
+        try Data(saved.utf8).write(to: libraryFolder.appending(path: "library.json"))
+
+        let library = Library(folder: libraryFolder)
+        XCTAssertEqual(library.setPaths.map(\.path), ["A", "A › B"],
+                       "cut where the loop closes, so both sets show")
+        XCTAssertEqual(library.subtree(of: try XCTUnwrap(UUID(uuidString: a))).count, 2)
+    }
+
+    @MainActor
+    func testTheGridAndSidebarFollowEveryChange() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let outer = library.createSet(named: "Outer")
+        let inner = library.createSet(named: "Inner", inside: outer.id)
+        library.importItems([try writeSVG("b", #"<path d="M1 1h4"/>"#)], into: inner.id)
+        library.importItems([try writeSVG("a", #"<path d="M2 2h4"/>"#)], into: outer.id)
+        func names() -> [String] { library.visibleIcons.map(\.name) }
+
+        XCTAssertEqual(names(), ["a", "b"])
+        XCTAssertEqual(library.count(in: .set(outer.id)), 2, "a set counts the sets inside it")
+        let b = try XCTUnwrap(library.icons.first { $0.name == "b" })
+        library.rename(b.id, to: "0")
+        XCTAssertEqual(names(), ["0", "a"], "a rename sorts again")
+        library.searchText = "a"
+        XCTAssertEqual(names(), ["a"])
+        library.searchText = ""
+        library.sidebar = .set(inner.id)
+        XCTAssertEqual(names(), ["0"])
+        library.moveSet(inner.id, into: nil)
+        XCTAssertEqual(library.count(in: .set(outer.id)), 1, "a set moved out stops counting")
+        library.perform(.icons([b.id]))
+        XCTAssertEqual(names(), [])
+    }
+
+    @MainActor
+    func testAlertsWaitTheirTurn() async throws {
+        let library = Library(folder: folder.appending(path: "Library"))
+        library.notice = Notice(title: "First", message: "")
+        library.notice = Notice(title: "Second", message: "")
+        XCTAssertEqual(library.notice?.title, "First", "a second alert doesn't replace the first")
+        library.notice = nil
+        XCTAssertNil(library.notice, "the first closes before the next opens")
+        for _ in 0..<10 where library.notice == nil { await Task.yield() }
+        XCTAssertEqual(library.notice?.title, "Second")
+        library.notice = nil
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertNil(library.notice)
+    }
+
+    @MainActor
     func testIconJarLibraryImportsWithItsStructure() throws {
         let (_, svg) = try makeSVGIcon()
         let jar = folder.appending(path: "Mine.ijlibrary")
@@ -857,13 +984,19 @@ final class ExportTests: XCTestCase {
             NULL, 0, NULL, NULL, 3, 2);
         INSERT INTO ZIJITEM VALUES ('2A3B4C5D-6E7F-4081-9203-A4B5C6D7E8F9', 'Odd', 'odd.-null-',
             NULL, 0, NULL, NULL, 3, 0);
+        INSERT INTO ZIJITEM VALUES ('7B8C9D0E-1F2A-4B3C-8D4E-5F6A7B8C9D0E', 'Escape',
+            '../../../home.svg', NULL, 0, NULL, NULL, 3, 0);
+        INSERT INTO ZIJITEM VALUES ('8C9D0E1F-2A3B-4C4D-9E5F-6A7B8C9D0E1F', 'No File', NULL, NULL,
+            0, NULL, NULL, 3, 0);
         """)
 
         let library = Library(folder: folder.appending(path: "Library"))
         let report = try library.importIconJar(jar, into: nil)
 
         XCTAssertEqual(report.imported, 3)
-        XCTAssertEqual(report.skipped, ["spin.gif"])
+        // "../../../home.svg" from Sets/F-LOOSE is the test's own home.svg, a real file.
+        XCTAssertEqual(report.skipped, ["spin.gif", "../../../home.svg (outside the library)"])
+        XCTAssertEqual(report.incomplete, 1, "the record with no file is counted, not lost")
         XCTAssertEqual(
             library.setPaths.map(\.path),
             ["Loose", "Mac Icons", "Mac Icons › Apps", "Mac Icons › Apps › DevIcon"],
