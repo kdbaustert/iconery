@@ -84,6 +84,8 @@ struct IconGridView: View {
             return .handled
         }
         .quickLookPreview($quickLookItem, in: quickLookItems)
+        // Lights up Edit ▸ Copy while the grid has focus; text fields keep their own Copy.
+        .onCopyCommand { library.copyProviders(for: library.selection) }
         // Return renames, as in Finder.
         .onKeyPress(.return) {
             guard library.selection.count == 1, let icon = library.selectedIcons.first else {
@@ -311,6 +313,13 @@ private struct IconMenu: View {
                 Button(entry.path) { library.move(targets, to: entry.set.id) }
             }
         }
+        Divider()
+        Button("Copy") { library.copyToPasteboard(targets) }
+        if targets.count == 1, icon.kind == .svg {
+            Button("Copy SVG Code") { library.copySVGCode(icon) }
+        }
+        Button("Reveal in Finder") { library.revealInFinder(targets) }
+        Divider()
         Button("Export…") {
             library.selection = targets
             library.exportSelection()

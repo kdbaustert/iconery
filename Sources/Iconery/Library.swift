@@ -633,6 +633,12 @@ final class Library {
         update(ids) { $0.setID = setID }
     }
 
+    /// Whether the menu bar offers Unstar: only when every selected icon is starred.
+    var selectionAllStarred: Bool {
+        let chosen = icons.filter { selection.contains($0.id) }
+        return !chosen.isEmpty && chosen.allSatisfy(\.starred)
+    }
+
     func clearRecents() {
         update(Set(icons.filter { $0.lastUsed != nil }.map(\.id))) { $0.lastUsed = nil }
     }
@@ -1477,16 +1483,80 @@ final class Library {
         draggingIDs = ids
         let dragged = icons.filter { ids.contains($0.id) }
         draggedLastUsed = Dictionary(uniqueKeysWithValues: dragged.map { ($0.id, $0.lastUsed) })
-        let folder = Exporter.dragRoot
-            .appending(path: UUID().uuidString)
-            .appending(path: dragged.count == 1 ? Exporter.safeFileName(icon.name) : "Icons")
+        // Everything must land under dragRoot, or a drop onto a set could not be told apart
+        // from an import.
+        let (folder, written) = writtenForTransfer(
+            dragged, under: Exporter.dragRoot,
+            name: dragged.count == 1 ? Exporter.safeFileName(icon.name) : "Icons",
+            leftOutOf: "the drag"
+        )
+        update(ids) { $0.lastUsed = .now }
+        let payload = written.count == 1 ? written[0] : folder
+        return NSItemProvider(contentsOf: payload) ?? NSItemProvider()
+    }
+
+    /// ⌘C and the menu's Copy: the selection goes on the pasteboard as the files a drag would
+    /// carry. Copying counts as using, as dragging does.
+    func copyToPasteboard(_ ids: Set<UUID>) {
+        let items = sortedIcons.filter { ids.contains($0.id) }
+        guard !items.isEmpty else { return }
+        let (_, written) = writtenForTransfer(
+            items, under: Self.openRoot, name: "Copied", leftOutOf: "the copy"
+        )
+        guard !written.isEmpty else { return }
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.writeObjects(written as [NSURL])
+        update(ids) { $0.lastUsed = .now }
+    }
+
+    /// The same files for the Edit menu's Copy, which hands the pasteboard providers instead.
+    func copyProviders(for ids: Set<UUID>) -> [NSItemProvider] {
+        let items = sortedIcons.filter { ids.contains($0.id) }
+        guard !items.isEmpty else { return [] }
+        let (_, written) = writtenForTransfer(
+            items, under: Self.openRoot, name: "Copied", leftOutOf: "the copy"
+        )
+        update(ids) { $0.lastUsed = .now }
+        return written.map { NSItemProvider(contentsOf: $0) ?? NSItemProvider() }
+    }
+
+    /// The icon's SVG source, for pasting straight into an editor or a design tool. The file as
+    /// it is, not the cleaned-up copy an SVG export can write.
+    func copySVGCode(_ icon: Icon) {
+        guard icon.kind == .svg, let data = try? Data(contentsOf: fileURL(for: icon)),
+              let text = String(data: data, encoding: .utf8)
+        else {
+            notice = Notice(
+                title: "“\(icon.name)” could not be copied",
+                message: "Its file is missing from the library folder or isn't text."
+            )
+            return
+        }
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+        update([icon.id]) { $0.lastUsed = .now }
+    }
+
+    /// Shows the library's own file. Read-only in spirit: moving or editing it there changes
+    /// the library, so the menu item says Finder rather than inviting that, as IconJar's does.
+    func revealInFinder(_ ids: Set<UUID>) {
+        let urls = icons.filter { ids.contains($0.id) }.map { fileURL(for: $0) }
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
+    /// Writes `items` out the way a drag or copy carries them: exported with the current
+    /// settings, or the original file when exporting fails, so nothing arrives as an empty
+    /// file. Icons whose files are missing are reported and left out.
+    private func writtenForTransfer(
+        _ items: [Icon], under root: URL, name: String, leftOutOf what: String
+    ) -> (folder: URL, written: [URL]) {
+        let folder = root.appending(path: UUID().uuidString).appending(path: name)
         var written: [URL] = []
         var missing: [String] = []
-        for item in dragged {
-            // Something must always land under dragRoot, or a drop onto a set could not be told
-            // apart from an import. When the export fails, the original file travels instead,
-            // and when that can't be read either the icon stays behind rather than arriving as
-            // an empty file.
+        for item in items {
             let files: [ExportFile]
             if let exported = try? exportFiles(for: item) {
                 files = exported
@@ -1502,13 +1572,11 @@ final class Library {
         }
         if !missing.isEmpty {
             notice = Notice(
-                title: "Some icons were left out of the drag",
+                title: "Some icons were left out of \(what)",
                 message: "Their files are missing from the library folder:\n" + Self.listed(missing)
             )
         }
-        update(ids) { $0.lastUsed = .now }
-        let payload = written.count == 1 ? written[0] : folder
-        return NSItemProvider(contentsOf: payload) ?? NSItemProvider()
+        return (folder, written)
     }
 }
 
