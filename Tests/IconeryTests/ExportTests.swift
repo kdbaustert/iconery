@@ -576,7 +576,17 @@ final class ExportTests: XCTestCase {
         preferences.sort = .fileType
         XCTAssertEqual(order(), ["b", "a", "c"], "PNG before SVG, then by name")
         preferences.sort = .dateAdded
-        XCTAssertEqual(order(), ["c", "a", "b"])
+        XCTAssertEqual(order(), ["c", "a", "b"], "a date sort starts newest first")
+        preferences.sortDescending = false
+        XCTAssertEqual(order(), ["b", "a", "c"], "flipped by the direction setting")
+        preferences.sort = .dateUsed
+        library.update([try XCTUnwrap(library.icons.first { $0.name == "b" }).id]) {
+            $0.lastUsed = .now
+        }
+        XCTAssertEqual(order(), ["b", "a", "c"], "the used icon first, the never-used by name")
+        preferences.sort = .name
+        XCTAssertFalse(preferences.sortDescending, "picking a key resets the direction")
+        XCTAssertEqual(order(), ["a", "b", "c"])
     }
 
     @MainActor

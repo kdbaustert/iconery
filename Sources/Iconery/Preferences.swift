@@ -24,7 +24,7 @@ enum BackupSchedule: String, CaseIterable, Identifiable {
 }
 
 enum GridSort: String, CaseIterable, Identifiable {
-    case name, fileType, dateAdded
+    case name, fileType, dateAdded, dateUsed
 
     var id: Self { self }
 
@@ -33,6 +33,29 @@ enum GridSort: String, CaseIterable, Identifiable {
         case .name: "Name"
         case .fileType: "File Type"
         case .dateAdded: "Date Added"
+        case .dateUsed: "Date Used"
+        }
+    }
+
+    /// The direction a key starts in when picked: names read A to Z, dates newest first.
+    var startsDescending: Bool {
+        switch self {
+        case .name, .fileType: false
+        case .dateAdded, .dateUsed: true
+        }
+    }
+
+    var ascendingTitle: String {
+        switch self {
+        case .name, .fileType: "A to Z"
+        case .dateAdded, .dateUsed: "Oldest First"
+        }
+    }
+
+    var descendingTitle: String {
+        switch self {
+        case .name, .fileType: "Z to A"
+        case .dateAdded, .dateUsed: "Newest First"
         }
     }
 }
@@ -69,7 +92,14 @@ final class Preferences {
     var backupsKept: Int { didSet { save(backupsKept, "backupsKept") } }
 
     // General
-    var sort: GridSort { didSet { save(sort.rawValue, "gridSort") } }
+    /// Picking a new key starts it in its usual direction: names A to Z, dates newest first.
+    var sort: GridSort {
+        didSet {
+            save(sort.rawValue, "gridSort")
+            if sort != oldValue { sortDescending = sort.startsDescending }
+        }
+    }
+    var sortDescending: Bool { didSet { save(sortDescending, "gridSortDescending") } }
     var labels: LabelMode { didSet { save(labels.rawValue, "gridLabels") } }
     var searchesTags: Bool { didSet { save(searchesTags, "searchTags") } }
     var searchesSetNames: Bool { didSet { save(searchesSetNames, "searchSetNames") } }
@@ -88,6 +118,10 @@ final class Preferences {
     var addsFinderTags: Bool { didSet { save(addsFinderTags, "exportAddsFinderTags") } }
     var revealsExports: Bool { didSet { save(revealsExports, "revealsExports") } }
 
+    // Window, restored at launch
+    var sidebarItem: String? { didSet { save(sidebarItem, "sidebarItem") } }
+    var expandedSetIDs: [String] { didSet { save(expandedSetIDs, "expandedSets") } }
+
     static let recentLimits = [25, 50, 100, 200, 500]
     static let backupCounts = [5, 10, 20, 50, 0]
 
@@ -96,7 +130,10 @@ final class Preferences {
         func stored<Value>(_ key: String) -> Value? { defaults?.object(forKey: key) as? Value }
         backupSchedule = stored("backupSchedule").flatMap(BackupSchedule.init) ?? .never
         backupsKept = stored("backupsKept") ?? 10
-        sort = stored("gridSort").flatMap(GridSort.init) ?? .name
+        let sortKey: GridSort = stored("gridSort").flatMap(GridSort.init) ?? .name
+        sort = sortKey
+        // Date Added showed newest first before direction existed, so that stays its default.
+        sortDescending = stored("gridSortDescending") ?? (sortKey == .dateAdded)
         labels = stored("gridLabels").flatMap(LabelMode.init) ?? .always
         searchesTags = stored("searchTags") ?? true
         searchesSetNames = stored("searchSetNames") ?? false
@@ -109,6 +146,8 @@ final class Preferences {
         keepsSetFolders = stored("exportKeepsSetFolders") ?? false
         addsFinderTags = stored("exportAddsFinderTags") ?? false
         revealsExports = stored("revealsExports") ?? true
+        sidebarItem = stored("sidebarItem")
+        expandedSetIDs = stored("expandedSets") ?? []
     }
 
     private func save(_ value: Any?, _ key: String) {

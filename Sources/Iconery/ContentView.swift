@@ -14,6 +14,7 @@ struct ContentView: View {
                 .navigationTitle(library.title(for: library.sidebar))
                 .searchable(text: $library.searchText, placement: .toolbar, prompt: "Search")
                 .toolbar {
+                    ToolbarItem { SortMenu() }
                     ToolbarItem {
                         Button { library.chooseAndImport() } label: {
                             Label("Import", systemImage: "square.and.arrow.down")
@@ -69,5 +70,31 @@ struct ContentView: View {
             get: { library[keyPath: keyPath] != nil },
             set: { if !$0 { library[keyPath: keyPath] = nil } }
         )
+    }
+}
+
+/// The toolbar's sort menu: the key and, under it, the direction, named for the key ("Z to A"
+/// for names, "Newest First" for dates). Settings ▸ General keeps its sort picker; both read the
+/// same preference, and picking a key resets the direction in Preferences itself.
+private struct SortMenu: View {
+    @Environment(Library.self) private var library
+
+    var body: some View {
+        @Bindable var preferences = library.preferences
+        Menu {
+            Picker("Sort By", selection: $preferences.sort) {
+                ForEach(GridSort.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.inline)
+            Divider()
+            Picker("Direction", selection: $preferences.sortDescending) {
+                Text(preferences.sort.ascendingTitle).tag(false)
+                Text(preferences.sort.descendingTitle).tag(true)
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Label("Sort", systemImage: "arrow.up.arrow.down")
+        }
+        .help("How the grid is sorted")
     }
 }

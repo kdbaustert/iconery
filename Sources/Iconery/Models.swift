@@ -82,6 +82,29 @@ struct License: Identifiable, Codable, Hashable {
 enum SidebarItem: Hashable {
     case all, recent, starred
     case set(UUID)
+
+    /// A defaults-friendly form, so the selection can be restored at the next launch.
+    var stored: String {
+        switch self {
+        case .all: "all"
+        case .recent: "recent"
+        case .starred: "starred"
+        case .set(let id): "set:\(id.uuidString)"
+        }
+    }
+
+    init?(stored: String) {
+        switch stored {
+        case "all": self = .all
+        case "recent": self = .recent
+        case "starred": self = .starred
+        default:
+            guard stored.hasPrefix("set:"),
+                  let id = UUID(uuidString: String(stored.dropFirst(4)))
+            else { return nil }
+            self = .set(id)
+        }
+    }
 }
 
 enum Naming {

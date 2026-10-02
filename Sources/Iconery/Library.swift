@@ -15,8 +15,12 @@ final class Library {
     // One window, so what it shows lives here rather than in a second object that the menu
     // commands would also have to reach.
 
-    var sidebar: SidebarItem? = .all
-    var expandedSets: Set<UUID> = []
+    var sidebar: SidebarItem? = .all {
+        didSet { preferences.sidebarItem = sidebar?.stored }
+    }
+    var expandedSets: Set<UUID> = [] {
+        didSet { preferences.expandedSetIDs = expandedSets.map(\.uuidString).sorted() }
+    }
     var selection: Set<UUID> = []
     var searchText = ""
     var export = ExportOptions.load() {
@@ -75,7 +79,8 @@ final class Library {
     // made from and rebuilt when that differs. An array still sharing storage with the kept one
     // compares equal without looking at its elements, so an unchanged library costs nothing.
     @ObservationIgnored private var cachedTree: (sets: [IconSet], children: [UUID?: [IconSet]])?
-    @ObservationIgnored private var cachedOrder: (icons: [Icon], sort: GridSort, sorted: [Icon])?
+    @ObservationIgnored
+    private var cachedOrder: (icons: [Icon], sort: GridSort, descending: Bool, sorted: [Icon])?
     @ObservationIgnored
     private var cachedCounts: (icons: [Icon], sets: [IconSet], bySet: [UUID: Int])?
     @ObservationIgnored private var cachedVisible: (key: VisibleKey, icons: [Icon])?
@@ -109,6 +114,16 @@ final class Library {
         backupFolder = Self.storedURL(Self.backupKey) ?? Self.defaultBackupFolder
         lastBackup = UserDefaults.standard.object(forKey: Self.lastBackupKey) as? Date
         load()
+        // Where the window left off, with anything pointing at a set that has gone dropped.
+        let known = Set(sets.map(\.id))
+        let rememberedSidebar = preferences.sidebarItem.flatMap(SidebarItem.init(stored:))
+        if case .set(let id) = rememberedSidebar, !known.contains(id) {
+            sidebar = .all
+        } else {
+            sidebar = rememberedSidebar ?? .all
+        }
+        expandedSets = Set(preferences.expandedSetIDs.compactMap(UUID.init(uuidString:)))
+            .intersection(known)
         let hadLocation = UserDefaults.standard.data(forKey: Self.libraryKey) != nil
         if folder == nil, hadLocation, remembered == nil {
             // The location is kept, so the library opens again once its drive is back.
@@ -280,25 +295,36 @@ final class Library {
     /// again until an icon or the order in Settings changes.
     private var sortedIcons: [Icon] {
         let sort = preferences.sort
-        if let cachedOrder, cachedOrder.sort == sort, cachedOrder.icons == icons {
+        let descending = preferences.sortDescending
+        if let cachedOrder, cachedOrder.sort == sort, cachedOrder.descending == descending,
+           cachedOrder.icons == icons {
             return cachedOrder.sorted
         }
         let result = sorted(icons)
-        cachedOrder = (icons, sort, result)
+        cachedOrder = (icons, sort, descending, result)
         return result
     }
 
-    /// In the order Settings ▸ General picks. Date Added puts the newest first.
+    /// In the key the toolbar's sort menu picks. The direction flips only that key: ties, like
+    /// icons of one file type or never used, read by name A to Z either way.
     private func sorted(_ icons: [Icon]) -> [Icon] {
+        let descending = preferences.sortDescending
+        func ordered<Key: Comparable>(_ key: (Icon) -> Key) -> [Icon] {
+            icons.sorted {
+                let (a, b) = (key($0), key($1))
+                return a == b ? Self.byName($0, $1) : (descending ? a > b : a < b)
+            }
+        }
         switch preferences.sort {
         case .name:
-            icons.sorted(by: Self.byName)
+            let ascending = icons.sorted(by: Self.byName)
+            return descending ? Array(ascending.reversed()) : ascending
         case .fileType:
-            icons.sorted {
-                $0.kind == $1.kind ? Self.byName($0, $1) : $0.kind.rawValue < $1.kind.rawValue
-            }
+            return ordered { $0.kind.rawValue }
         case .dateAdded:
-            icons.sorted { $0.added > $1.added }
+            return ordered(\.added)
+        case .dateUsed:
+            return ordered { $0.lastUsed ?? .distantPast }
         }
     }
 
@@ -340,6 +366,7 @@ final class Library {
         var sidebar: SidebarItem?
         var searchText: String
         var sort: GridSort
+        var descending: Bool
         var recentLimit: Int
         var scope: SearchScope
     }
@@ -351,7 +378,8 @@ final class Library {
         )
         let key = VisibleKey(
             icons: icons, sets: sets, sidebar: sidebar, searchText: searchText,
-            sort: preferences.sort, recentLimit: preferences.recentLimit, scope: scope
+            sort: preferences.sort, descending: preferences.sortDescending,
+            recentLimit: preferences.recentLimit, scope: scope
         )
         if let cachedVisible, cachedVisible.key == key { return cachedVisible.icons }
         var shown = icons(in: sidebar)
