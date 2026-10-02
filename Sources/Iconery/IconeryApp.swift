@@ -2,11 +2,15 @@ import SwiftUI
 
 @main
 struct IconeryApp: App {
-    @State private var library = Library()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @State private var library: Library
 
     init() {
         // Before the first window draws, so a chosen Light or Dark never flashes the other.
         Appearance.saved.apply()
+        let library = Library()
+        _library = State(initialValue: library)
+        appDelegate.library = library
     }
 
     var body: some Scene {
@@ -65,5 +69,28 @@ struct IconeryApp: App {
                 Button("Back Up Library Now") { library.backUpNow() }
             }
         }
+    }
+}
+
+/// Takes files opened with Iconery: dropped on the Dock icon, or sent with Finder's Open With.
+/// They go where the Import settings send loose files. An app launched by opening a file hears
+/// about it before the scene exists, so the URLs wait until the library is wired up.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var library: Library? {
+        didSet { deliver() }
+    }
+    private var waiting: [URL] = []
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        waiting += urls
+        deliver()
+    }
+
+    private func deliver() {
+        guard let library, !waiting.isEmpty else { return }
+        let urls = waiting
+        waiting = []
+        library.importAndReport(urls, into: nil)
     }
 }
