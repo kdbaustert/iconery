@@ -305,7 +305,10 @@ enum SVGCleaner {
     static func clean(_ svg: String, _ options: SVGCleanup) -> String {
         var svg = svg
         if options.removesDeclaration {
-            svg = svg.replacing(#/^\s*<\?xml[^>]*\?>\s*/#, with: "")
+            // The whitespace after "xml" keeps a file that opens with <?xml-stylesheet …?>
+            // instead of a declaration from losing its stylesheet; a declaration always has
+            // attributes after "<?xml ".
+            svg = svg.replacing(#/^\s*<\?xml\s[^>]*\?>\s*/#, with: "")
         }
         if options.removesComments {
             svg = svg.replacing(#/<!--[\s\S]*?-->/#, with: "")
@@ -437,8 +440,10 @@ enum Exporter {
         let format = options.format
         if format == .svg || format == .original {
             var data = try Data(contentsOf: source)
-            if format == .svg, icon.kind == .svg, options.svgCleanup.changesAnything {
-                let text = String(decoding: data, as: UTF8.self)
+            // Only UTF-8 text is cleaned: decoding Latin-1 or UTF-16 bytes as UTF-8 and
+            // re-encoding what comes out corrupts them, so such a file goes out as it is.
+            if format == .svg, icon.kind == .svg, options.svgCleanup.changesAnything,
+               let text = String(data: data, encoding: .utf8) {
                 let cleaned = SVGCleaner.clean(text, options.svgCleanup)
                 data = Data(cleaned.utf8)
             }
@@ -500,9 +505,10 @@ enum Exporter {
         let names = fileNames(for: icon, options: options)
         if icon.kind == .svg {
             var data = try Data(contentsOf: source)
-            if options.svgCleanup.changesAnything {
-                data = Data(SVGCleaner.clean(String(decoding: data, as: UTF8.self),
-                                             options.svgCleanup).utf8)
+            // Cleaned only when the bytes are UTF-8, as the SVG export path is.
+            if options.svgCleanup.changesAnything,
+               let text = String(data: data, encoding: .utf8) {
+                data = Data(SVGCleaner.clean(text, options.svgCleanup).utf8)
             }
             let stem = (names[0] as NSString).deletingPathExtension
             return [
@@ -539,28 +545,35 @@ enum Exporter {
 
     /// Writes into `folder`, never over an existing file. A name holding a slash is a file
     /// inside a folder, like an image set's Contents.json: a clash renames at that folder, so
-    /// its contents stay together.
+    /// its contents stay together. Returns what a caller should hand on — each loose file,
+    /// and each such folder once in place of its contents, so a drag carries the image set
+    /// itself, Finder tags land on it, and Show in Finder selects it whole.
     @discardableResult
     static func write(_ files: [ExportFile], to folder: URL) throws -> [URL] {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         var renamed: [String: String] = [:]
-        return try files.map { file in
+        var written: [URL] = []
+        for file in files {
             let url: URL
             if let slash = file.name.firstIndex(of: "/") {
                 let top = String(file.name[..<slash])
                 let rest = String(file.name[file.name.index(after: slash)...])
                 let unique = renamed[top] ?? uniqueURL(for: top, in: folder).lastPathComponent
-                renamed[top] = unique
+                if renamed[top] == nil {
+                    renamed[top] = unique
+                    written.append(folder.appending(path: unique))
+                }
                 url = folder.appending(path: unique).appending(path: rest)
                 try FileManager.default.createDirectory(
                     at: url.deletingLastPathComponent(), withIntermediateDirectories: true
                 )
             } else {
                 url = uniqueURL(for: file.name, in: folder)
+                written.append(url)
             }
             try file.data.write(to: url, options: .withoutOverwriting)
-            return url
         }
+        return written
     }
 
     /// Finder's rule for a clash: "home.png" becomes "home 2.png", then "home 3.png".

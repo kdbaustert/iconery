@@ -87,7 +87,9 @@ private struct BatchRenameSheet: View {
     @State private var rename = BatchRename()
 
     var body: some View {
-        let icons = library.selectedIcons
+        // batchRenameTargets, not selectedIcons: the rename applies in the grid's order,
+        // which Recently Used sorts by last use, and Sequence numbers must match the preview.
+        let icons = library.batchRenameTargets
         VStack(alignment: .leading, spacing: 12) {
             Text("Rename \(plural(icons.count, "Icon"))")
                 .font(.title3.bold())
@@ -109,7 +111,9 @@ private struct BatchRenameSheet: View {
             }
             let pairs = previewPairs(icons)
             VStack(alignment: .leading, spacing: 2) {
-                ForEach(pairs.prefix(4), id: \.0) { old, new in
+                // Keyed by icon id, not by old name: two icons sharing a name are two rows.
+                ForEach(pairs.prefix(4), id: \.id) { pair in
+                    let (old, new) = (pair.old, pair.new)
                     Text(old == new ? "\(old) — unchanged" : "\(old) → \(new)")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -129,7 +133,7 @@ private struct BatchRenameSheet: View {
                     library.batchRenaming = false
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(pairs.allSatisfy { $0.0 == $0.1 })
+                .disabled(pairs.allSatisfy { $0.old == $0.new })
             }
         }
         .padding(20)
@@ -138,12 +142,12 @@ private struct BatchRenameSheet: View {
     }
 
     /// Old and new name per icon, with "no change" answers folded back to the old name.
-    private func previewPairs(_ icons: [Icon]) -> [(String, String)] {
+    private func previewPairs(_ icons: [Icon]) -> [(id: UUID, old: String, new: String)] {
         icons.enumerated().map { index, icon in
             let raw = rename.newName(for: icon.name, index: index)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let raw, !raw.isEmpty else { return (icon.name, icon.name) }
-            return (icon.name, raw)
+            guard let raw, !raw.isEmpty else { return (icon.id, icon.name, icon.name) }
+            return (icon.id, icon.name, raw)
         }
     }
 }

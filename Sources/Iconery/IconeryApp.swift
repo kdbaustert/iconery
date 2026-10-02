@@ -64,7 +64,14 @@ struct IconeryApp: App {
                     .disabled(library.selection.isEmpty)
                 Divider()
                 Button(library.preferences.confirmsIconDeletion ? "Delete…" : "Delete") {
-                    library.requestDeleteIcons(library.selection)
+                    // ⌘⌫ reaches the menu before any text field sees it, and in a field it
+                    // means "delete to the start of the line" — typing an icon's name mustn't
+                    // delete the selection. Hand the key back to the field editor.
+                    if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
+                        editor.deleteToBeginningOfLine(nil)
+                    } else {
+                        library.requestDeleteIcons(library.selection)
+                    }
                 }
                 .keyboardShortcut(.delete)
                 .disabled(library.selection.isEmpty)
@@ -78,6 +85,7 @@ struct IconeryApp: App {
                     .disabled(library.selection.isEmpty || !library.canExport)
                 Divider()
                 Button("Back Up Library Now") { library.backUpNow() }
+                    .disabled(library.isBackingUp)
                 Button("Check Library…") { Task { await library.checkLibrary() } }
                     .disabled(library.isChecking)
             }

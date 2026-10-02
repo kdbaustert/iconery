@@ -1071,6 +1071,136 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
+    func testPruningReadsTheDateInTheNameNotPlainTextOrder() throws {
+        let backups = folder.appending(path: "Backups")
+        try FileManager.default.createDirectory(at: backups, withIntermediateDirectories: true)
+        for name in [
+            "Iconery Backup 2026-09-01 at 10.00.00.iconerybackup",
+            // Two in the same second: the " 2" uniqueURL adds sorts before the dot as plain
+            // text, which used to make the newer file the first one trashed.
+            "Iconery Backup 2026-09-02 at 10.00.00.iconerybackup",
+            "Iconery Backup 2026-09-02 at 10.00.00 2.iconerybackup",
+            // Starts with the prefix but isn't a backup; it used to count as the newest.
+            "Iconery Backup keep.zip",
+            "Iconery Backup 2026-09-02 at 10.00.00.iconerybackup.partial",
+        ] {
+            try Data().write(to: backups.appending(path: name))
+        }
+        XCTAssertEqual(
+            Library.backupsToPrune(in: backups, keeping: 2).map(\.lastPathComponent),
+            ["Iconery Backup 2026-09-01 at 10.00.00.iconerybackup"],
+            "the same-second pair counts \" 2\" as newer, and only real backup names count"
+        )
+        Library.pruneBackups(in: backups, keeping: 2)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: backups.path()).sorted(),
+            [
+                "Iconery Backup 2026-09-02 at 10.00.00 2.iconerybackup",
+                "Iconery Backup 2026-09-02 at 10.00.00.iconerybackup",
+                "Iconery Backup keep.zip",
+            ],
+            "pruning also clears a .partial a dead app left behind, and keeps the user's file"
+        )
+    }
+
+    @MainActor
+    func testSavingFollowsALibraryFolderMovedInFinder() throws {
+        let (_, source) = try makeSVGIcon()
+        let original = folder.appending(path: "Library")
+        let library = Library(folder: original)
+        library.importItems([source], into: library.createSet(named: "Set").id)
+
+        // What Finder's rename or move amounts to on disk, mid-session.
+        let moved = folder.appending(path: "Renamed")
+        try FileManager.default.moveItem(at: original, to: moved)
+        library.createSet(named: "After")
+
+        // By name, not URL: the bookmark resolves through /private, which /var symlinks to.
+        XCTAssertEqual(library.folder.lastPathComponent, "Renamed",
+                       "the library carries on in the moved folder")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: original.path(percentEncoded: false)),
+            "nothing recreates the old path: that would split the library in two"
+        )
+        XCTAssertEqual(Library(folder: moved).setPaths.map(\.path), ["After", "Set"])
+        XCTAssertNotNil(library.image(for: try XCTUnwrap(library.icons.first)))
+    }
+
+    @MainActor
+    func testCheckLibraryActionsIgnoreWhatChangedDuringTheScan() async throws {
+        let (_, source) = try makeSVGIcon()
+        // Import-time duplicate skipping off, or the identical "copy" below never gets in.
+        let library = Library(
+            folder: folder.appending(path: "Library"),
+            preferences: preferences { $0.skipsDuplicates = false }
+        )
+        library.importItems([source], into: nil)
+        await library.checkLibrary()
+        XCTAssertEqual(library.check?.orphans, [])
+
+        // An icon imported after the scan: its file is an orphan to the scan's snapshot.
+        let late = try writeSVG("late", #"<circle cx="12" cy="12" r="9"/>"#)
+        library.importItems([late], into: nil)
+        library.check?.orphans = try FileManager.default.contentsOfDirectory(
+            at: library.iconsFolder, includingPropertiesForKeys: nil
+        )
+        library.trashOrphans()
+        for icon in library.icons {
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: library.fileURL(for: icon).path(percentEncoded: false)
+                ),
+                "“\(icon.name)” is live, so its file is not an orphan to trash"
+            )
+        }
+
+        // A duplicate group whose oldest copy went after the scan keeps its oldest survivor.
+        let copy = try writeSVG("copy", #"<circle cx="12" cy="12" r="9"/>"#)
+        library.importItems([copy], into: nil)
+        await library.checkLibrary()
+        let group = try XCTUnwrap(library.check?.duplicateGroups.first)
+        XCTAssertEqual(group.count, 2)
+        library.perform(.icons([try XCTUnwrap(group.first).id]))
+        library.deleteDuplicates()
+        XCTAssertEqual(
+            library.icons.filter { $0.name == "copy" || $0.name == "late" }.count, 1,
+            "the remaining copy survives; deleting it too would wipe the whole group"
+        )
+    }
+
+    @MainActor
+    func testUndoKeepsARecentlyUsedStampMadeAfterTheStep() throws {
+        let (_, source) = try makeSVGIcon()
+        let library = Library(folder: folder.appending(path: "Library"))
+        let undoManager = UndoManager()
+        // One group per action, opened by hand: the implicit per-event grouping needs a run
+        // loop, and a test turn has none.
+        undoManager.groupsByEvent = false
+        library.undoManager = undoManager
+        func act(_ change: () -> Void) {
+            undoManager.beginUndoGrouping()
+            defer { undoManager.endUndoGrouping() }
+            change()
+        }
+        act { library.importItems([source], into: nil) }
+        let id = try XCTUnwrap(library.icons.first).id
+
+        act { library.rename(id, to: "Renamed") }
+        // A copy stamps Recently Used outside any undo step.
+        library.update([id]) { $0.lastUsed = .now }
+        let stamped = try XCTUnwrap(library.icons.first?.lastUsed)
+        undoManager.undo()
+
+        XCTAssertNotEqual(library.icons.first?.name, "Renamed")
+        XCTAssertEqual(library.icons.first?.lastUsed, stamped,
+                       "undoing the rename doesn't revert the later stamp")
+        act { library.clearRecents() }
+        undoManager.undo()
+        XCTAssertEqual(library.icons.first?.lastUsed, stamped,
+                       "undoing Clear Recently Used puts the dates back")
+    }
+
+    @MainActor
     func testScheduledBackupRunsOnlyWhenDue() async throws {
         let preferences = preferences { $0.backupSchedule = .daily }
         let library = Library(folder: folder.appending(path: "Library"), preferences: preferences)

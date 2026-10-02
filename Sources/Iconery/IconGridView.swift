@@ -140,7 +140,11 @@ struct IconGridView: View {
             }
         }
         .dropDestination(for: URL.self) { urls, _ in
-            library.handleDrop(urls, onto: library.currentSetID)
+            // A drag that began in this grid and ends over it is a slipped drag, not a move:
+            // the grid shows nested sets' icons too, and "move to the set being viewed" would
+            // quietly pull one out of its set. Moves go through the sidebar's rows.
+            guard !Library.isGridDrag(urls) else { return false }
+            return library.handleDrop(urls, onto: library.currentSetID)
         } isTargeted: { isDropTarget = $0 }
         .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar(count: icons.count) }
     }

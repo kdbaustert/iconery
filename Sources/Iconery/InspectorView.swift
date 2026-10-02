@@ -169,7 +169,9 @@ private struct ExportBar: View {
 
             Spacer(minLength: 0)
             FillSwatch(fill: $library.export.fill)
-                .disabled(!options.format.isBitmap)
+                // exportFormats, not the picked format: a preset brings formats of its own
+                // while keeping the fill, so the swatch follows what would be written.
+                .disabled(!library.exportFormats.contains(where: \.isBitmap))
             Button { showsOptions = true } label: {
                 Label("Export Options", systemImage: "slider.horizontal.3").labelStyle(.iconOnly)
             }
@@ -312,6 +314,9 @@ private struct ExportOptionsForm: View {
 
     var body: some View {
         @Bindable var library = library
+        // What exporting would write now — the preset's formats when one is active — so the
+        // background and quality a preset keeps stay reachable while it is.
+        let formats = library.exportFormats
         let format = library.export.format
         Form {
             Section("File Name") {
@@ -327,10 +332,11 @@ private struct ExportOptionsForm: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            if format.isBitmap {
+            if formats.contains(where: \.isBitmap) {
                 Section("Background") {
                     Toggle(
-                        format == .jpg ? "Color (JPG is white without one)" : "Fill the background",
+                        formats.contains(.jpg)
+                            ? "Color (JPG is white without one)" : "Fill the background",
                         isOn: hasBackground
                     )
                     if library.export.background != nil {
@@ -338,7 +344,7 @@ private struct ExportOptionsForm: View {
                     }
                 }
             }
-            if format == .jpg {
+            if formats.contains(.jpg) {
                 Section("Quality") {
                     Slider(value: $library.export.quality, in: 0.3...1) {
                         Text("\(Int(library.export.quality * 100))%").monospacedDigit()
@@ -640,8 +646,12 @@ private struct OpenInButton: View {
     var body: some View {
         let file = library.fileURL(for: icon)
         let apps = NSWorkspace.shared.urlsForApplications(toOpen: file)
-        let chosen = apps.first { $0.path(percentEncoded: false) == remembered }
-            ?? NSWorkspace.shared.urlForApplication(toOpen: file)
+        // The remembered app may have come through "Other…" and so be missing from macOS's
+        // list for this file type; it still counts as long as it's installed.
+        let rememberedApp = remembered.isEmpty ? nil : URL(filePath: remembered)
+        let chosen = rememberedApp.flatMap {
+            FileManager.default.fileExists(atPath: $0.path(percentEncoded: false)) ? $0 : nil
+        } ?? NSWorkspace.shared.urlForApplication(toOpen: file)
         Menu {
             ForEach(apps, id: \.self) { app in
                 Button { pick(app) } label: {
