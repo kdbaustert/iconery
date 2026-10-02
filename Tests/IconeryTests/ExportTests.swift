@@ -402,10 +402,19 @@ final class ExportTests: XCTestCase {
                 XCTAssertTrue(littleEndian || bytes.starts(with: [0x4D, 0x4D, 0, 0x2A]))
             case .svg, .original:
                 XCTAssertEqual(files[0].data, try Data(contentsOf: source), "\(format): as is")
+            case .imageset:
+                XCTAssertTrue(
+                    String(decoding: files[0].data, as: UTF8.self).contains("\"images\""),
+                    "imageset: Contents.json first"
+                )
             default:
                 XCTAssertTrue(bytes.starts(with: try XCTUnwrap(magic[format])), "\(format)")
             }
-            XCTAssertEqual(files[0].name, Exporter.fileNames(for: icon, options: options)[0])
+            // An image set's files live inside the named folder; everything else is the name.
+            XCTAssertTrue(
+                files[0].name.hasPrefix(Exporter.fileNames(for: icon, options: options)[0]),
+                "\(format)"
+            )
         }
     }
 
@@ -903,6 +912,56 @@ final class ExportTests: XCTestCase {
         let long = Exporter.safeFileName(String(repeating: "é", count: 300))
         XCTAssertEqual(long.utf8.count, 200)
         XCTAssertEqual(long, String(repeating: "é", count: 100))
+    }
+
+    @MainActor
+    func testImagesetExportsVectorSVGAndScaledBitmaps() throws {
+        var options = ExportOptions()
+        options.format = .imageset
+        options.pngSizes = [32]
+
+        // An SVG goes in as itself, marked to keep its vector representation.
+        let svgSource = try writeSVG("home", #"<path d="M3 10l9-7 9 7"/>"#)
+        let svgIcon = Icon(name: "home", setID: UUID(), kind: .svg)
+        let vector = try Exporter.files(
+            for: svgIcon, source: svgSource, image: NSImage(contentsOf: svgSource),
+            options: options
+        )
+        XCTAssertEqual(
+            vector.map(\.name), ["home.imageset/Contents.json", "home.imageset/home.svg"]
+        )
+        let json = String(decoding: vector[0].data, as: UTF8.self)
+        XCTAssertTrue(json.contains("preserves-vector-representation"))
+
+        // Anything else becomes 1x, 2x and 3x PNGs of the picked size.
+        let pngSource = try writePNG("photo")
+        let pngIcon = Icon(name: "photo", setID: UUID(), kind: .png)
+        let bitmap = try Exporter.files(
+            for: pngIcon, source: pngSource, image: NSImage(contentsOf: pngSource),
+            options: options
+        )
+        XCTAssertEqual(bitmap.map(\.name), [
+            "photo.imageset/Contents.json", "photo.imageset/photo.png",
+            "photo.imageset/photo@2x.png", "photo.imageset/photo@3x.png",
+        ])
+        let widths = bitmap.dropFirst().compactMap { NSBitmapImageRep(data: $0.data)?.pixelsWide }
+        XCTAssertEqual(widths, [32, 64, 96])
+        XCTAssertFalse(
+            String(decoding: bitmap[0].data, as: UTF8.self)
+                .contains("preserves-vector-representation")
+        )
+
+        // A clash renames at the folder, so a set's contents stay together.
+        let out = folder.appending(path: "Out")
+        try Exporter.write(vector, to: out)
+        try Exporter.write(vector, to: out)
+        let listed = try FileManager.default.contentsOfDirectory(atPath:
+            out.path(percentEncoded: false)).sorted()
+        XCTAssertEqual(listed, ["home 2.imageset", "home.imageset"])
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: out.appending(path: "home 2.imageset/Contents.json")
+                .path(percentEncoded: false)
+        ))
     }
 
     func testExportNamesFollowTheNamingSetting() {

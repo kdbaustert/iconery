@@ -5,17 +5,24 @@ import UniformTypeIdentifiers
 /// IconJar's format list, less the two macOS can't write: WebP (ImageIO reads it but has no writer,
 /// measured on macOS 27) and EPS. In the order the format menu shows them.
 enum ExportFormat: String, CaseIterable, Codable, Identifiable {
-    case png, jpg, tiff, gif, pdf, ico, icns, svg, original
+    case png, jpg, tiff, gif, pdf, ico, icns, svg, original, imageset
 
     var id: Self { self }
 
-    var title: String { self == .original ? "Original" : rawValue.uppercased() }
+    var title: String {
+        switch self {
+        case .original: "Original"
+        case .imageset: "Xcode Image Set"
+        default: rawValue.uppercased()
+        }
+    }
 
-    /// Drawn from a bitmap at each size, so these take the fill and background colours.
-    var isBitmap: Bool { [.png, .jpg, .tiff, .gif, .ico, .icns].contains(self) }
+    /// Drawn from a bitmap at each size, so these take the fill and background colours. An
+    /// image set is only partly one: an SVG goes in as itself, anything else as 1x/2x/3x PNGs.
+    var isBitmap: Bool { [.png, .jpg, .tiff, .gif, .ico, .icns, .imageset].contains(self) }
 
     /// One file per picked size, so a size can go in the file name.
-    var writesFilePerSize: Bool { [.png, .jpg, .tiff, .gif, .pdf].contains(self) }
+    var writesFilePerSize: Bool { [.png, .jpg, .tiff, .gif, .pdf, .imageset].contains(self) }
 
     var imageType: UTType? {
         switch self {
@@ -411,6 +418,11 @@ enum Exporter {
         // as.
         case .svg, .original: return ["\(base).\(icon.kind.rawValue)"]
         case .ico, .icns: return ["\(base).\(ext)"]
+        case .imageset:
+            // An SVG keeps its vector representation in one universal set; sizes don't apply.
+            if icon.kind == .svg { return ["\(base).imageset"] }
+            let named = options.includeSize || options.pngSizes.count > 1
+            return options.pngSizes.map { named ? "\(base)-\($0).imageset" : "\(base).imageset" }
         default:
             let named = options.includeSize || options.pngSizes.count > 1
             return options.pngSizes.map { named ? "\(base)-\($0).\(ext)" : "\(base).\(ext)" }
@@ -431,6 +443,9 @@ enum Exporter {
                 data = Data(cleaned.utf8)
             }
             return [ExportFile(name: names[0], data: data)]
+        }
+        if format == .imageset {
+            return try imageset(for: icon, source: source, image: image, options: options)
         }
         let sizes = switch format {
         case .ico: options.sizes.filter { $0 <= 256 }
@@ -465,12 +480,84 @@ enum Exporter {
         }
     }
 
-    /// Writes into `folder`, never over an existing file.
+    /// A folder Xcode drags in whole: Contents.json beside the images. An SVG goes in as itself
+    /// with its vector representation preserved; anything else as 1x/2x/3x PNGs of each picked
+    /// size, through the same fill and background as a PNG export.
+    @MainActor
+    private static func imageset(
+        for icon: Icon, source: URL, image: NSImage?, options: ExportOptions
+    ) throws -> [ExportFile] {
+        func contents(_ images: [[String: String]], vector: Bool) throws -> Data {
+            var json: [String: Any] = [
+                "images": images,
+                "info": ["author": "xcode", "version": 1],
+            ]
+            if vector { json["properties"] = ["preserves-vector-representation": true] }
+            return try JSONSerialization.data(
+                withJSONObject: json, options: [.prettyPrinted, .sortedKeys]
+            )
+        }
+        let names = fileNames(for: icon, options: options)
+        if icon.kind == .svg {
+            var data = try Data(contentsOf: source)
+            if options.svgCleanup.changesAnything {
+                data = Data(SVGCleaner.clean(String(decoding: data, as: UTF8.self),
+                                             options.svgCleanup).utf8)
+            }
+            let stem = (names[0] as NSString).deletingPathExtension
+            return [
+                ExportFile(name: "\(names[0])/Contents.json", data: try contents(
+                    [["filename": "\(stem).svg", "idiom": "universal"]], vector: true
+                )),
+                ExportFile(name: "\(names[0])/\(stem).svg", data: data),
+            ]
+        }
+        guard !options.pngSizes.isEmpty else { throw Failure.noSizes }
+        guard let image else { throw Failure.unreadable(icon.name) }
+        return try zip(names, options.pngSizes).flatMap { folder, base -> [ExportFile] in
+            let stem = (folder as NSString).deletingPathExtension
+            var images: [[String: String]] = []
+            var files: [ExportFile] = []
+            for scale in 1...3 {
+                let fileName = "\(stem)\(scale == 1 ? "" : "@\(scale)x").png"
+                let drawn = try drawn(
+                    image, pixels: base * scale, options: options, name: icon.name
+                )
+                files.append(ExportFile(
+                    name: "\(folder)/\(fileName)",
+                    data: try encoded(drawn, as: .png, options, icon.name)
+                ))
+                images.append(["filename": fileName, "idiom": "universal", "scale": "\(scale)x"])
+            }
+            files.insert(
+                ExportFile(name: "\(folder)/Contents.json",
+                           data: try contents(images, vector: false)), at: 0
+            )
+            return files
+        }
+    }
+
+    /// Writes into `folder`, never over an existing file. A name holding a slash is a file
+    /// inside a folder, like an image set's Contents.json: a clash renames at that folder, so
+    /// its contents stay together.
     @discardableResult
     static func write(_ files: [ExportFile], to folder: URL) throws -> [URL] {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var renamed: [String: String] = [:]
         return try files.map { file in
-            let url = uniqueURL(for: file.name, in: folder)
+            let url: URL
+            if let slash = file.name.firstIndex(of: "/") {
+                let top = String(file.name[..<slash])
+                let rest = String(file.name[file.name.index(after: slash)...])
+                let unique = renamed[top] ?? uniqueURL(for: top, in: folder).lastPathComponent
+                renamed[top] = unique
+                url = folder.appending(path: unique).appending(path: rest)
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+                )
+            } else {
+                url = uniqueURL(for: file.name, in: folder)
+            }
             try file.data.write(to: url, options: .withoutOverwriting)
             return url
         }
