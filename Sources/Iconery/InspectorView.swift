@@ -30,6 +30,10 @@ struct InspectorView: View {
                     Divider().padding(.vertical, 2)
                     DetailsFields(icon: icon)
                         .id(icon.id)
+                    if selected.count > 1 {
+                        Divider().padding(.vertical, 2)
+                        BulkFields(icons: selected)
+                    }
                     InfoRows(icon: icon)
                     OpenInButton(icon: icon)
                         .frame(maxWidth: .infinity)
@@ -448,6 +452,67 @@ private struct ExportButton: View {
             return "Only SVG icons have a vector version. The rest export as their own file."
         }
         return nil
+    }
+}
+
+/// Edits that land on every selected icon at once, under the paged single-icon fields. Tags
+/// here add to or leave each icon's own; they never replace them wholesale.
+private struct BulkFields: View {
+    @Environment(Library.self) private var library
+    @State private var newTags = ""
+    let icons: [Icon]
+
+    var body: some View {
+        let ids = Set(icons.map(\.id))
+        VStack(alignment: .leading, spacing: 8) {
+            Text("All \(icons.count) Selected")
+                .font(.headline)
+            HStack(spacing: 6) {
+                TextField("Add tags, comma-separated", text: $newTags)
+                    .onSubmit(addTags)
+                Button("Add", action: addTags)
+                    .disabled(newTags.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            let shared = sharedTags
+            if !shared.isEmpty {
+                Menu("Remove Tag") {
+                    ForEach(shared, id: \.self) { tag in
+                        Button(tag) { library.removeTag(ids, tag) }
+                    }
+                }
+            }
+            Menu {
+                Button("No License") { library.setLicense(ids, nil) }
+                Divider()
+                ForEach(library.licenses) { license in
+                    Button(license.name) { library.setLicense(ids, license.id) }
+                }
+            } label: {
+                Text("License: \(licenseLabel)").lineLimit(1)
+            }
+        }
+    }
+
+    /// Tags carried by any selected icon, for removal; a tag only some of them have still shows.
+    private var sharedTags: [String] {
+        var seen: Set<String> = []
+        var ordered: [String] = []
+        for tag in icons.flatMap(\.tags) where seen.insert(tag).inserted {
+            ordered.append(tag)
+        }
+        return ordered
+    }
+
+    private var licenseLabel: String {
+        let ids = Set(icons.map(\.licenseID))
+        guard ids.count == 1, let only = ids.first else { return "Mixed" }
+        guard let only else { return "None" }
+        return library.licenses.first { $0.id == only }?.name ?? "None"
+    }
+
+    private func addTags() {
+        library.addTags(Set(icons.map(\.id)), newTags.components(separatedBy: ","))
+        newTags = ""
     }
 }
 

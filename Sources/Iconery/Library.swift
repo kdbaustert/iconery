@@ -839,6 +839,21 @@ final class Library {
         recording("Change Description") { update([id]) { $0.info = text.isEmpty ? nil : text } }
     }
 
+    /// Adds `tags` to every icon in `ids` that doesn't already carry them.
+    func addTags(_ ids: Set<UUID>, _ tags: [String]) {
+        let cleaned = tags.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return }
+        recording("Add Tags") {
+            update(ids) { icon in
+                for tag in cleaned where !icon.tags.contains(tag) { icon.tags.append(tag) }
+            }
+        }
+    }
+
+    func removeTag(_ ids: Set<UUID>, _ tag: String) {
+        recording("Remove Tag") { update(ids) { $0.tags.removeAll { $0 == tag } } }
+    }
+
     func setLicense(_ ids: Set<UUID>, _ licenseID: UUID?) {
         recording("Change License") { update(ids) { $0.licenseID = licenseID } }
     }
