@@ -64,13 +64,21 @@ struct IconeryApp: App {
                     .disabled(library.selection.isEmpty)
                 Divider()
                 Button(library.preferences.confirmsIconDeletion ? "Delete…" : "Delete") {
-                    // ⌘⌫ reaches the menu before any text field sees it, and in a field it
-                    // means "delete to the start of the line" — typing an icon's name mustn't
-                    // delete the selection. Hand the key back to the field editor.
-                    if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
+                    // ⌘⌫ reaches the menu before any other responder sees it. In a text field
+                    // it means "delete to the start of the line" — typing an icon's name
+                    // mustn't delete the selection — so the field editor gets it back.
+                    let window = NSApp.keyWindow
+                    if let editor = window?.firstResponder as? NSTextView {
                         editor.deleteToBeginningOfLine(nil)
-                    } else {
+                    } else if let window, window === AppDelegate.libraryWindow,
+                              window.attachedSheet == nil {
                         library.requestDeleteIcons(library.selection)
+                    } else {
+                        // A sheet, Settings or any other window: the icons behind it aren't
+                        // what the key means there. Pass it down the responder chain as
+                        // delete:, which a sheet's list handling onDeleteCommand answers and
+                        // which otherwise goes nowhere.
+                        NSApp.sendAction(#selector(NSText.delete(_:)), to: nil, from: nil)
                     }
                 }
                 .keyboardShortcut(.delete)
@@ -101,6 +109,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var library: Library? {
         didSet { deliver() }
     }
+    /// The library's window, set by ContentView once it has one. Found by that rather than by
+    /// an identifier or title, which SwiftUI picks and which Settings could share. Settings
+    /// never hosts ContentView, so it can't be mistaken for the library.
+    static weak var libraryWindow: NSWindow?
     private var waiting: [URL] = []
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -110,8 +122,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func deliver() {
         guard let library, !waiting.isEmpty else { return }
-        let urls = waiting
+        // Not the grid's own drags: a drag released on Iconery's Dock icon carries the staged
+        // export, which would otherwise be imported back as a copy. The window's drop targets
+        // turn these down the same way.
+        let urls = waiting.filter { !Library.isGridDrag([$0]) }
         waiting = []
+        guard !urls.isEmpty else { return }
         library.importAndReport(urls, into: nil)
     }
 }

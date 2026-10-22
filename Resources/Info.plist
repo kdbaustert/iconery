@@ -43,6 +43,35 @@
 		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
+			<string>Folder</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>None</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.folder</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>IconJar Library</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>None</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.iconjar-library</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>ijlibrary</string>
+				<string>iconjarlibrary</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
 			<string>Iconery Backup</string>
 			<key>CFBundleTypeRole</key>
 			<string>None</string>

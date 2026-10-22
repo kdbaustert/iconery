@@ -34,6 +34,7 @@ struct ContentView: View {
                         .inspectorColumnWidth(min: 260, ideal: 290, max: 400)
                 }
         }
+        .background(LibraryWindowMarker())
         .onChange(of: library.sidebar) { library.selection = [] }
         // The window's undo manager, so Edit ▸ Undo reaches the library while text fields
         // keep their own.
@@ -240,5 +241,19 @@ private struct SortMenu: View {
             Label("Sort", systemImage: "arrow.up.arrow.down")
         }
         .help("How the grid is sorted")
+    }
+}
+
+/// Tells the app delegate which window is the library's, so ⌘⌫ can tell it from a sheet or
+/// from Settings.
+private struct LibraryWindowMarker: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { Marker() }
+
+    func updateNSView(_ view: NSView, context: Context) {}
+
+    private final class Marker: NSView {
+        override func viewDidMoveToWindow() {
+            AppDelegate.libraryWindow = window
+        }
     }
 }

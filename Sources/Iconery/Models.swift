@@ -212,7 +212,11 @@ struct BatchRename: Equatable {
     func newName(for name: String, index: Int) -> String? {
         switch mode {
         case .replace:
-            guard !find.isEmpty, name.localizedCaseInsensitiveContains(find) else { return nil }
+            // The same comparison the replace makes below: the locale-aware contains would
+            // disagree with it under a Turkish locale, where "i" and "I" aren't a pair.
+            guard !find.isEmpty, name.range(of: find, options: .caseInsensitive) != nil else {
+                return nil
+            }
             return name.replacingOccurrences(of: find, with: replacement, options: .caseInsensitive)
         case .add:
             guard !prefix.isEmpty || !suffix.isEmpty else { return nil }

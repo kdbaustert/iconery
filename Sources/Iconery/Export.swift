@@ -1,5 +1,6 @@
 import AppKit
 import ImageIO
+import os
 import UniformTypeIdentifiers
 
 /// IconJar's format list, less the two macOS can't write: WebP (ImageIO reads it but has no writer,
@@ -104,7 +105,10 @@ struct ExportOptions: Codable, Equatable {
         }
     }
 
-    var isExportable: Bool { sizeChoices.isEmpty || !sizes.isEmpty }
+    /// An image set is listed with the formats that need sizes, but an SVG in one is written as
+    /// itself (see `Exporter.files`), so it can't be called unexportable without knowing the
+    /// icons. A raster icon in a set with no sizes is reported by Exporter.Failure.noSizes.
+    var isExportable: Bool { format == .imageset || sizeChoices.isEmpty || !sizes.isEmpty }
 
     private static let defaultsKey = "exportOptions"
 
@@ -148,16 +152,19 @@ extension ExportOptions {
             ?? fallback.svgCleanup
     }
 
-    /// The settings for each output of `preset`, keeping this export's fill, background and
-    /// quality. Outputs that would share a file name get the size added to it.
+    /// The settings for each output of `preset`, keeping this export's fill, background,
+    /// quality, prefix and suffix. The preset's own prefix and suffix go beside them, the
+    /// user's prefix first and the preset's suffix last, so `@2x` still ends the name. The
+    /// preset decides the sizes, so "include size" is its own. Outputs that would share a file
+    /// name get the size added to it.
     func outputs(of preset: ExportPreset) -> [ExportOptions] {
         preset.outputs.map { output in
             var options = self
             options.presetID = nil
             options.format = output.format
             options.sizes = output.sizes
-            options.prefix = output.prefix
-            options.suffix = output.suffix
+            options.prefix = prefix + output.prefix
+            options.suffix = suffix + output.suffix
             let twins = preset.outputs.filter {
                 $0.format == output.format && $0.prefix == output.prefix
                     && $0.suffix == output.suffix
@@ -263,14 +270,41 @@ struct ExportPreset: Identifiable, Codable, Hashable {
 
     private static let defaultsKey = "exportPresets"
 
-    /// The user's own presets, kept app-wide like the rest of the export settings.
+    /// The user's own presets, kept app-wide like the rest of the export settings. Each is
+    /// decoded on its own, so one this build can't read (a format a later version added) costs
+    /// only itself, not the rest.
     static func loadSaved() -> [ExportPreset] {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey) else { return [] }
-        return (try? JSONDecoder().decode([ExportPreset].self, from: data)) ?? []
+        stored().compactMap { try? JSONDecoder().decode(ExportPreset.self, from: $0.data) }
     }
 
+    /// Writes `presets` back with the stored entries this build can't decode left in place, so
+    /// a newer build's preset survives a round trip through this one.
     static func save(_ presets: [ExportPreset]) {
-        UserDefaults.standard.set(try? JSONEncoder().encode(presets), forKey: defaultsKey)
+        let unreadable = stored().filter {
+            (try? JSONDecoder().decode(ExportPreset.self, from: $0.data)) == nil
+        }
+        guard let data = try? JSONEncoder().encode(presets) else { return }
+        guard !unreadable.isEmpty,
+              let current = try? JSONSerialization.jsonObject(with: data) as? [Any],
+              let merged = try? JSONSerialization.data(
+                  withJSONObject: current + unreadable.map(\.object)
+              )
+        else {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+            return
+        }
+        UserDefaults.standard.set(merged, forKey: defaultsKey)
+    }
+
+    /// The saved array's elements, each as parsed JSON and as its own bytes.
+    private static func stored() -> [(object: Any, data: Data)] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let items = try? JSONSerialization.jsonObject(with: data) as? [Any]
+        else { return [] }
+        return items.compactMap { item in
+            JSONSerialization.isValidJSONObject(item)
+                ? (try? JSONSerialization.data(withJSONObject: item)).map { (item, $0) } : nil
+        }
     }
 }
 
@@ -371,16 +405,33 @@ enum SVGCleaner {
                   let match = svg.firstMatch(of: pattern),
                   let value = match.output[1].substring
             else { return nil }
-            let decoded = String(value)
-                .replacingOccurrences(of: "&lt;", with: "<")
-                .replacingOccurrences(of: "&gt;", with: ">")
-                .replacingOccurrences(of: "&quot;", with: "\"")
-                .replacingOccurrences(of: "&apos;", with: "'")
-                .replacingOccurrences(of: "&amp;", with: "&")
+            let decoded = decodedEntities(String(value))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return decoded.isEmpty ? nil : decoded
         }
         return (text("title"), text("desc"))
+    }
+
+    /// Text content as XML reads it, in one pass so a decoded "&amp;" is never decoded again:
+    /// the five named entities, decimal and hex character references, and CDATA taken as it
+    /// stands. A reference to something that isn't a character, or to a control character, is
+    /// left as written.
+    private static func decodedEntities(_ text: String) -> String {
+        let named = ["lt": "<", "gt": ">", "quot": "\"", "apos": "'", "amp": "&"]
+        return text.replacing(
+            #/<!\[CDATA\[([\s\S]*?)\]\]>|&(?:#([0-9]+)|#[xX]([0-9a-fA-F]+)|([a-z]+));/#
+        ) { match in
+            if let raw = match.output.1 { return String(raw) }
+            let code = match.output.2.flatMap { UInt32($0) }
+                ?? match.output.3.flatMap { UInt32($0, radix: 16) }
+            // Control characters (bar tab, LF and CR) have no place in a name either.
+            let control = code.map { ($0 < 0x20 && $0 != 9 && $0 != 10 && $0 != 13) || $0 == 0x7F }
+            if let code, control == false, let scalar = Unicode.Scalar(code) {
+                return String(Character(scalar))
+            }
+            if let name = match.output.4, let value = named[String(name)] { return value }
+            return String(match.output.0)
+        }
     }
 }
 
@@ -406,6 +457,16 @@ enum Exporter {
     static let dragRoot = FileManager.default.temporaryDirectory
         .appending(path: "IconeryDrag", directoryHint: .isDirectory)
 
+    /// Every name exporting `icon` writes with `preset` active, or with `options` alone when
+    /// there is none. Goes through `outputs(of:)`, as the export does, so a preview can't
+    /// disagree with the files.
+    static func fileNames(
+        for icon: Icon, options: ExportOptions, preset: ExportPreset?
+    ) -> [String] {
+        let settings = preset.map { options.outputs(of: $0) } ?? [options]
+        return settings.flatMap { fileNames(for: icon, options: $0) }
+    }
+
     /// The names exporting `icon` writes, before anything is drawn: prefix, name and suffix, then
     /// the size when asked for or when several sizes would otherwise share one name.
     static func fileNames(for icon: Icon, options: ExportOptions) -> [String] {
@@ -414,7 +475,7 @@ enum Exporter {
         case .originalFileName: icon.originalName ?? icon.name
         case .tags: icon.tags.isEmpty ? icon.name : icon.tags.joined(separator: "-")
         }
-        let base = safeFileName(options.prefix + stem + options.suffix)
+        let base = safeFileName(stem, prefix: options.prefix, suffix: options.suffix)
         let ext = options.format.rawValue
         switch options.format {
         // An icon that isn't an SVG has no vector version, so it goes out as the file it came in
@@ -432,7 +493,6 @@ enum Exporter {
         }
     }
 
-    @MainActor
     static func files(
         for icon: Icon, source: URL, image: NSImage?, options: ExportOptions
     ) throws -> [ExportFile] {
@@ -485,10 +545,41 @@ enum Exporter {
         }
     }
 
+    /// The files a drag or copy carries for each of `items`, in the same order, drawn on every
+    /// core at once. A drag has to hand over real files before it can begin, so the work can't
+    /// be deferred, only spread out: 9,000 icons take about 3 s on one core, which stalled the
+    /// window at the moment the mouse moved.
+    ///
+    /// Nothing here touches the library. Each item gets an NSImage of its own, read from its file,
+    /// because an NSImage is safe on a thread only while that thread is its only user, and
+    /// NSGraphicsContext.current is per thread. That is also why the library's image cache stays
+    /// out of it. An icon that can't be drawn is carried as the file it came in as, so nothing
+    /// arrives empty; one whose file is gone comes back nil.
+    static func transferFiles(
+        _ items: [(icon: Icon, source: URL)], settings: [ExportOptions]
+    ) -> [[ExportFile]?] {
+        // Each slot is written once, by the iteration that owns it. The lock only makes that
+        // visible to the compiler and the other cores; it is held for one assignment.
+        let slots = OSAllocatedUnfairLock<[[ExportFile]?]>(
+            initialState: Array(repeating: nil, count: items.count)
+        )
+        DispatchQueue.concurrentPerform(iterations: items.count) { index in
+            let (icon, source) = items[index]
+            let image = NSImage(contentsOf: source)
+            let drawn = try? settings.flatMap {
+                try files(for: icon, source: source, image: image, options: $0)
+            }
+            let result = drawn ?? (try? Data(contentsOf: source)).map {
+                [ExportFile(name: "\(safeFileName(icon.name)).\(icon.kind.rawValue)", data: $0)]
+            }
+            slots.withLock { $0[index] = result }
+        }
+        return slots.withLock { $0 }
+    }
+
     /// A folder Xcode drags in whole: Contents.json beside the images. An SVG goes in as itself
     /// with its vector representation preserved; anything else as 1x/2x/3x PNGs of each picked
     /// size, through the same fill and background as a PNG export.
-    @MainActor
     private static func imageset(
         for icon: Icon, source: URL, image: NSImage?, options: ExportOptions
     ) throws -> [ExportFile] {
@@ -550,47 +641,99 @@ enum Exporter {
     /// itself, Finder tags land on it, and Show in Finder selects it whole.
     @discardableResult
     static func write(_ files: [ExportFile], to folder: URL) throws -> [URL] {
+        var claimed: Set<URL> = []
+        let (jobs, written) = try plan(files, in: folder, claimed: &claimed)
+        for job in jobs { try job.data.write(to: job.url, options: .withoutOverwriting) }
+        return written
+    }
+
+    /// `write` for many icons' files at once, one batch per icon, as a drag or copy produces
+    /// them. Every name is decided first, one batch after another, so a clash is renamed the way
+    /// it would have been writing the batches in turn; only then are the bytes written, on every
+    /// core. A batch that can't be written whole comes back empty, as a throwing `write` does
+    /// for the caller who skips it with `try?`.
+    static func write(batches: [[ExportFile]], to folder: URL) -> [[URL]] {
+        var claimed: Set<URL> = []
+        var jobs: [(batch: Int, url: URL, data: Data)] = []
+        var written: [[URL]] = []
+        for (batch, files) in batches.enumerated() {
+            guard let planned = try? plan(files, in: folder, claimed: &claimed) else {
+                written.append([])
+                continue
+            }
+            jobs += planned.jobs.map { (batch, $0.url, $0.data) }
+            written.append(planned.written)
+        }
+        let failed = OSAllocatedUnfairLock<Set<Int>>(initialState: [])
+        let planned = jobs
+        DispatchQueue.concurrentPerform(iterations: planned.count) { index in
+            let job = planned[index]
+            do {
+                try job.data.write(to: job.url, options: .withoutOverwriting)
+            } catch {
+                failed.withLock { _ = $0.insert(job.batch) }
+            }
+        }
+        for batch in failed.withLock({ $0 }) { written[batch] = [] }
+        return written
+    }
+
+    /// Decides where each of `files` goes and makes the folders they need, writing nothing.
+    /// `claimed` holds the names already decided for earlier files that aren't on disk yet.
+    private static func plan(
+        _ files: [ExportFile], in folder: URL, claimed: inout Set<URL>
+    ) throws -> (jobs: [(url: URL, data: Data)], written: [URL]) {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         var renamed: [String: String] = [:]
+        var jobs: [(url: URL, data: Data)] = []
         var written: [URL] = []
         for file in files {
             let url: URL
             if let slash = file.name.firstIndex(of: "/") {
                 let top = String(file.name[..<slash])
                 let rest = String(file.name[file.name.index(after: slash)...])
-                let unique = renamed[top] ?? uniqueURL(for: top, in: folder).lastPathComponent
+                let unique = renamed[top]
+                    ?? uniqueURL(for: top, in: folder, avoiding: claimed).lastPathComponent
                 if renamed[top] == nil {
                     renamed[top] = unique
                     written.append(folder.appending(path: unique))
+                    claimed.insert(folder.appending(path: unique))
                 }
                 url = folder.appending(path: unique).appending(path: rest)
                 try FileManager.default.createDirectory(
                     at: url.deletingLastPathComponent(), withIntermediateDirectories: true
                 )
             } else {
-                url = uniqueURL(for: file.name, in: folder)
+                url = uniqueURL(for: file.name, in: folder, avoiding: claimed)
+                claimed.insert(url)
                 written.append(url)
             }
-            try file.data.write(to: url, options: .withoutOverwriting)
+            jobs.append((url, file.data))
         }
-        return written
+        return (jobs, written)
     }
 
     /// Finder's rule for a clash: "home.png" becomes "home 2.png", then "home 3.png".
     static func uniqueURL(for name: String, in folder: URL) -> URL {
-        let first = folder.appending(path: name)
-        guard FileManager.default.fileExists(atPath: first.path(percentEncoded: false)) else {
-            return first
+        uniqueURL(for: name, in: folder, avoiding: [])
+    }
+
+    private static func uniqueURL(
+        for name: String, in folder: URL, avoiding claimed: Set<URL>
+    ) -> URL {
+        func taken(_ url: URL) -> Bool {
+            claimed.contains(url)
+                || FileManager.default.fileExists(atPath: url.path(percentEncoded: false))
         }
+        let first = folder.appending(path: name)
+        guard taken(first) else { return first }
         let stem = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
         var number = 2
         while true {
             let name = ext.isEmpty ? "\(stem) \(number)" : "\(stem) \(number).\(ext)"
             let candidate = folder.appending(path: name)
-            if !FileManager.default.fileExists(atPath: candidate.path(percentEncoded: false)) {
-                return candidate
-            }
+            if !taken(candidate) { return candidate }
             number += 1
         }
     }
@@ -599,19 +742,38 @@ enum Exporter {
     /// Control characters become spaces, and the name stops at 200 bytes: APFS allows 255, which
     /// leaves room for a size, a " 2" and an extension added after.
     static func safeFileName(_ name: String) -> String {
-        var cleaned = name
+        finished(replacingForbidden(in: name))
+    }
+
+    /// `stem` between a prefix and a suffix. Only the stem is cut to fit 200 bytes, so the
+    /// suffix (a preset's `@2x` or `-xxhdpi`) is what tells outputs apart and must survive a
+    /// long name. Cut by character, never through one. Only if the prefix and suffix alone
+    /// overflow does the whole name get cut, as `safeFileName` does.
+    static func safeFileName(_ stem: String, prefix: String, suffix: String) -> String {
+        let head = replacingForbidden(in: prefix)
+        let tail = replacingForbidden(in: suffix)
+        var body = replacingForbidden(in: stem)
+        let room = max(0, 200 - head.utf8.count - tail.utf8.count)
+        while body.utf8.count > room { body.removeLast() }
+        return finished(head + body + tail)
+    }
+
+    private static func replacingForbidden(in name: String) -> String {
+        name
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
             .components(separatedBy: CharacterSet(charactersIn: "\u{0}"..."\u{1F}"))
             .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func finished(_ name: String) -> String {
+        var cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
         while cleaned.hasPrefix(".") { cleaned.removeFirst() }
         while cleaned.utf8.count > 200 { cleaned.removeLast() }
         return cleaned.isEmpty ? "icon" : cleaned
     }
 
     /// `image` at `pixels` a side, with the fill and background applied.
-    @MainActor
     private static func drawn(
         _ image: NSImage, pixels: Int, options: ExportOptions, name: String
     ) throws -> CGImage {
@@ -643,7 +805,6 @@ enum Exporter {
 enum Raster {
     /// Draws `image` aspect-fit and centred on a transparent square of `pixels` a side. An SVG is
     /// drawn as vectors at that size, so every export size is sharp rather than scaled.
-    @MainActor
     static func render(_ image: NSImage, pixels: Int) -> CGImage? {
         guard pixels > 0, image.size.width > 0, image.size.height > 0,
               let space = CGColorSpace(name: CGColorSpace.sRGB),
@@ -768,7 +929,6 @@ enum Raster {
     }
 
     /// A one-page PDF `side` points square. An SVG stays vector, since NSImage draws it as paths.
-    @MainActor
     static func pdf(_ image: NSImage, side: Int) -> Data? {
         guard image.size.width > 0, image.size.height > 0 else { return nil }
         let data = NSMutableData()

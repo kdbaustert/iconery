@@ -8,10 +8,11 @@ let package = Package(
         .executableTarget(
             name: "Iconery",
             path: "Sources/Iconery",
-            // Swift 6 language mode. Everything runs on the main actor: icons are small enough
-            // that drawing and exporting them inline never stalls the window, so there is no
-            // handoff for strict checking to object to, and it will catch one if a background
-            // task ever appears.
+            // Swift 6 language mode. The library and every view live on the main actor. The one
+            // exception is a drag or copy of many icons, which draws and writes its files on
+            // every core: each work item gets plain values and its own image, and touches no
+            // library state. Strict checking is what proves that stays true, so a later change
+            // that hands main-actor state to those threads fails to compile.
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

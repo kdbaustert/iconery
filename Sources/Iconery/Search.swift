@@ -22,15 +22,19 @@ func iconMatches(_ icon: Icon, query: String, setPath: String, scope: SearchScop
     if scope.setNames { fields.append(setPath) }
     if scope.descriptions, let info = icon.info { fields.append(info) }
     func found(_ word: some StringProtocol, in fields: [String]) -> Bool {
-        fields.contains {
+        // A bare "tag:" has nothing to look for yet; range(of: "") finds nothing, which would
+        // hide every icon while the word is still being typed.
+        word.isEmpty || fields.contains {
             $0.range(of: word, options: [.caseInsensitive, .diacriticInsensitive]) != nil
         }
     }
     return words.allSatisfy { word in
         let lowered = word.lowercased()
         if lowered.hasPrefix("tag:") { return found(word.dropFirst(4), in: icon.tags) }
-        if lowered.hasPrefix("kind:") { return icon.kind.rawValue == lowered.dropFirst(5) }
-        if lowered.hasPrefix("type:") { return icon.kind.rawValue == lowered.dropFirst(5) }
+        if lowered.hasPrefix("kind:") || lowered.hasPrefix("type:") {
+            let kind = lowered.dropFirst(5)
+            return kind.isEmpty || icon.kind.rawValue == kind
+        }
         if lowered.hasPrefix("set:") { return found(word.dropFirst(4), in: [setPath]) }
         return found(word, in: fields)
     }

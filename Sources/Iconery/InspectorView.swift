@@ -5,10 +5,19 @@ import SwiftUI
 /// and fill along its foot; the icon's details; its file information; and Open In.
 struct InspectorView: View {
     @Environment(Library.self) private var library
-    /// Which of several selected icons the preview shows.
-    @State private var page = 0
+    /// Which of several selected icons the preview shows, by id: the list is sorted, so a
+    /// position would land on a different icon once a rename re-sorts it. nil, or an icon that
+    /// has left the selection, means the first.
+    @State private var pagedID: UUID?
 
+    // The selection's onChange lives out here, not in a branch, so it also fires when the
+    // selection goes from empty straight to several icons.
     var body: some View {
+        content.onChange(of: library.selection) { pagedID = nil }
+    }
+
+    @ViewBuilder
+    private var content: some View {
         let selected = library.selectedIcons
         if selected.isEmpty {
             ContentUnavailableView(
@@ -16,14 +25,14 @@ struct InspectorView: View {
                 description: Text("Select icons to see their details and export them.")
             )
         } else {
-            let index = min(page, selected.count - 1)
+            let index = selected.firstIndex { $0.id == pagedID } ?? 0
             let icon = selected[index]
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     PreviewHeader(
                         icon: icon, index: index, count: selected.count,
                         canStep: { canStep($0, icon: icon, index: index, count: selected.count) },
-                        step: { step($0, icon: icon, index: index, count: selected.count) }
+                        step: { step($0, icon: icon, index: index, in: selected) }
                     )
                     QuickDragWell(icon: icon)
                     ExportButton(icons: selected)
@@ -40,15 +49,15 @@ struct InspectorView: View {
                 }
                 .padding(16)
             }
-            .onChange(of: library.selection) { page = 0 }
         }
     }
 
     /// With several selected the arrows page through them, as IconJar's do; with one they move
     /// to the next icon in the grid.
-    private func step(_ offset: Int, icon: Icon, index: Int, count: Int) {
-        if count > 1 {
-            page = index + offset
+    private func step(_ offset: Int, icon: Icon, index: Int, in selected: [Icon]) {
+        if selected.count > 1 {
+            guard selected.indices.contains(index + offset) else { return }
+            pagedID = selected[index + offset].id
         } else {
             library.selectNeighbour(of: icon.id, by: offset)
         }
@@ -322,10 +331,13 @@ private struct ExportOptionsForm: View {
             Section("File Name") {
                 TextField("Prefix", text: $library.export.prefix)
                 TextField("Suffix", text: $library.export.suffix)
+                // A preset decides its sizes, and with them whether each name carries one.
                 Toggle("Include size in file name", isOn: $library.export.includeSize)
-                    .disabled(!format.writesFilePerSize)
+                    .disabled(!format.writesFilePerSize || library.activePreset != nil)
                 if let icon = library.selectedIcons.first {
-                    let names = Exporter.fileNames(for: icon, options: library.export)
+                    let names = Exporter.fileNames(
+                        for: icon, options: library.export, preset: library.activePreset
+                    )
                     Text(names.prefix(2).joined(separator: ", ") + (names.count > 2 ? ", …" : ""))
                         .font(.caption)
                         .monospaced()
@@ -447,9 +459,7 @@ private struct ExportButton: View {
     /// What a preset will write, or why SVG can't apply to every icon.
     private var note: String? {
         if let preset = library.activePreset, let icon = icons.first {
-            let names = library.export.outputs(of: preset).flatMap {
-                Exporter.fileNames(for: icon, options: $0)
-            }
+            let names = Exporter.fileNames(for: icon, options: library.export, preset: preset)
             let more = names.count > 3 ? ", …" : ""
             return "\(plural(names.count, "file")) per icon: "
                 + names.prefix(3).joined(separator: ", ") + more
@@ -575,7 +585,8 @@ private struct DetailsFields: View {
 }
 
 /// AppKit's token field, so tags show as tokens the way IconJar's do. Saves when editing ends.
-private struct TagField: NSViewRepresentable {
+/// Not private only so the tests can reach its coordinator.
+struct TagField: NSViewRepresentable {
     let tags: [String]
     let commit: ([String]) -> Void
 
@@ -589,8 +600,7 @@ private struct TagField: NSViewRepresentable {
 
     func updateNSView(_ field: NSTokenField, context: Context) {
         context.coordinator.commit = commit
-        // Not while typing, or the tokens would be reset under the cursor.
-        if field.currentEditor() == nil { field.objectValue = tags }
+        context.coordinator.refresh(field, to: tags)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(commit: commit) }
@@ -598,19 +608,68 @@ private struct TagField: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTokenFieldDelegate {
         var commit: ([String]) -> Void
+        /// The tags the model last told this field about. Editing ends by committing whatever
+        /// the field holds, so a change made elsewhere meanwhile (Remove Tag in the bulk
+        /// fields) would be committed straight back unless the field knows it happened.
+        private var known: [String] = []
+        private var removedMeanwhile: Set<String> = []
+        /// How many of each tag the field held when editing began. Only that many are taken
+        /// out for a tag removed meanwhile; a further one is something the user typed, even if
+        /// they typed the very tag that was removed.
+        private var heldAtStart: [String: Int]?
+        private var addedMeanwhile: [String] = []
 
         init(commit: @escaping ([String]) -> Void) {
             self.commit = commit
         }
 
+        func refresh(_ field: NSTokenField, to tags: [String]) {
+            defer { known = tags }
+            guard field.currentEditor() != nil else {
+                field.objectValue = tags
+                removedMeanwhile = []
+                addedMeanwhile = []
+                heldAtStart = nil
+                return
+            }
+            // `known` is still what the field held when editing began until this first change.
+            if heldAtStart == nil {
+                heldAtStart = known.reduce(into: [:]) { $0[$1, default: 0] += 1 }
+            }
+            // Mid-edit the tokens aren't reset, or they'd change under the cursor and lose
+            // what was typed. The outside change is remembered and applied to what the field
+            // holds when editing ends, so the commit carries only what the user changed.
+            removedMeanwhile.formUnion(known.filter { !tags.contains($0) })
+            addedMeanwhile += tags.filter { !known.contains($0) }
+            removedMeanwhile.subtract(addedMeanwhile)
+        }
+
         func controlTextDidEndEditing(_ notification: Notification) {
             guard let field = notification.object as? NSTokenField else { return }
             // A token field holds an array of tokens, or a bare string while nothing is tokenized.
-            if let tokens = field.objectValue as? [Any] {
-                commit(tokens.compactMap { $0 as? String })
+            let tokens: [String]
+            if let held = field.objectValue as? [Any] {
+                tokens = held.compactMap { $0 as? String }
             } else if let text = field.objectValue as? String {
-                commit(text.split(separator: ",").map(String.init))
+                tokens = text.split(separator: ",").map(String.init)
+            } else {
+                return
             }
+            var held = heldAtStart ?? [:]
+            let kept = tokens.filter { token in
+                guard removedMeanwhile.contains(token), let left = held[token], left > 0 else {
+                    return true
+                }
+                held[token] = left - 1
+                return false
+            }
+            let committed = kept + addedMeanwhile.filter { !kept.contains($0) }
+            commit(committed)
+            // The model is about to echo this back; it isn't an outside change.
+            known = committed
+            removedMeanwhile = []
+            addedMeanwhile = []
+            heldAtStart = nil
         }
     }
 }

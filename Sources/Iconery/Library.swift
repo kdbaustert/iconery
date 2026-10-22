@@ -91,6 +91,18 @@ final class Library {
     @ObservationIgnored private var openedFallbackLibrary = false
     /// Why the last scheduled backup failed, kept until one succeeds.
     @ObservationIgnored private var lastScheduledFailure: String?
+    /// File names of the backups this library wrote, kept in library.json beside `lastBackup`.
+    /// Pruning looks only at these, so a user's own files and another library's backups in the
+    /// same folder are never counted or trashed.
+    @ObservationIgnored private var backupNames: [String] = []
+    /// Set when the backup folder chosen in Settings can't be found, say on a drive that isn't
+    /// plugged in. Falling back to the default folder would scatter backups the user didn't
+    /// ask for, so scheduled backups sit out until it resolves again or another is chosen.
+    @ObservationIgnored private var backupFolderMissing = false
+    /// Whether the notice about a library folder in the Trash has been shown for this stay there.
+    @ObservationIgnored private var warnedOfTrash = false
+    /// Held to remove it on deinit, which isn't on the main actor.
+    @ObservationIgnored private nonisolated(unsafe) var activationObserver: NSObjectProtocol?
 
     // What the views would otherwise work out again on every redraw: one sort of a 9,000-icon
     // library takes 28 ms (measured), and a click used to run three. Each is kept with what it was
@@ -123,8 +135,12 @@ final class Library {
 
     /// Opens the library chosen in Settings, or the default one. Passing `folder` opens that
     /// library instead and ignores the remembered one, which tests rely on, as they do on passing
-    /// their own `preferences`.
-    init(folder: URL? = nil, preferences: Preferences = .shared) {
+    /// their own `preferences` and on `defaultFolder`, where the stand-in for a library that
+    /// can't be found opens.
+    init(
+        folder: URL? = nil, defaultFolder: URL = Library.defaultFolder,
+        preferences: Preferences = .shared
+    ) {
         self.preferences = preferences
         // Without limits these only shed under memory pressure, and a 256 pt grid keeps a 1 MB
         // thumbnail per icon scrolled past.
@@ -132,11 +148,16 @@ final class Library {
         images.countLimit = 500
         exportFolder = Self.storedURL(Self.exportKey)
         let remembered = Self.storedURL(Self.libraryKey)
-        self.folder = folder ?? remembered ?? Self.defaultFolder
-        backupFolder = Self.storedURL(Self.backupKey) ?? Self.defaultBackupFolder
-        lastBackup = UserDefaults.standard.object(forKey: Self.lastBackupKey) as? Date
+        self.folder = folder ?? remembered ?? defaultFolder
+        let storedBackupFolder = Self.storedBackupFolder()
+        backupFolder = storedBackupFolder ?? Self.defaultBackupFolder
+        backupFolderMissing = storedBackupFolder == nil
+            && UserDefaults.standard.data(forKey: Self.backupKey) != nil
         // nil for a library that has never been saved; the first save takes one instead.
         folderBookmark = try? self.folder.bookmarkData()
+        let hadIndex = FileManager.default.fileExists(
+            atPath: self.folder.appending(path: "library.json").path(percentEncoded: false)
+        )
         load()
         // Where the window left off, with anything pointing at a set that has gone dropped.
         let known = Set(sets.map(\.id))
@@ -159,8 +180,30 @@ final class Library {
                     + "library for now. Choose Settings ▸ Switch to open yours again."
             )
         }
+        // Backups used to be tracked for the whole Mac. The library opened at launch takes that
+        // date once, and save() clears it from UserDefaults when it lands in the index, so it
+        // can never be mistaken for another library's. Not the stand-in for a missing library,
+        // and not a brand-new one: neither is the library those backups were made of.
+        if lastBackup == nil, hadIndex, !openedFallbackLibrary {
+            lastBackup = UserDefaults.standard.object(forKey: Self.lastBackupKey) as? Date
+        }
+        if backupFolderMissing {
+            notice = Self.backupFolderMissingNotice
+        }
         try? FileManager.default.removeItem(at: Exporter.dragRoot)
         try? FileManager.default.removeItem(at: Self.openRoot)
+        // A Finder move always deactivates the app first, so coming back is when to look. That
+        // way what only reads the folder (thumbnails, export, drag, Quick Look) follows a move
+        // too, without waiting for an edit.
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { _ = self?.followMovedFolder() }
+        }
+    }
+
+    deinit {
+        if let activationObserver { NotificationCenter.default.removeObserver(activationObserver) }
     }
 
     // MARK: Persistence
@@ -172,12 +215,19 @@ final class Library {
         var licenses: [License]?
         /// Optional, like licenses: libraries from before smart sets still decode.
         var smartSets: [SmartSet]?
+        /// Backups belong to a library rather than the Mac, so a second library backing up into
+        /// the same folder isn't thought up to date, or pruned, by the first one's.
+        var lastBackup: Date?
+        /// File names of the backups this library wrote. See `backupNames`.
+        var backups: [String]?
     }
 
     private func load() {
         // A different library's past is not this one's to undo.
         undoManager?.removeAllActions()
         indexUnreadable = false
+        lastBackup = nil
+        backupNames = []
         let data: Data
         do {
             data = try Data(contentsOf: indexURL)
@@ -198,10 +248,14 @@ final class Library {
         decoder.dateDecodingStrategy = .iso8601
         do {
             let index = try decoder.decode(Index.self, from: data)
-            sets = index.sets
-            icons = index.icons
-            licenses = index.licenses ?? License.starters
-            smartSets = index.smartSets ?? []
+            // A repeated id would crash the dictionaries built from these, so the first of each
+            // stays: a hand-edited or copy-pasted index is the only way one gets here.
+            sets = Self.firstOfEachID(index.sets)
+            icons = Self.firstOfEachID(index.icons)
+            licenses = Self.firstOfEachID(index.licenses ?? License.starters)
+            smartSets = Self.firstOfEachID(index.smartSets ?? [])
+            lastBackup = index.lastBackup
+            backupNames = index.backups ?? []
             repairSetTree()
         } catch {
             // Set an unreadable index aside before anything saves an empty library over it.
@@ -223,6 +277,11 @@ final class Library {
                 )
             }
         }
+    }
+
+    private static func firstOfEachID<Item: Identifiable>(_ items: [Item]) -> [Item] {
+        var seen: Set<Item.ID> = []
+        return items.filter { seen.insert($0.id).inserted }
     }
 
     /// Makes every set reachable from the top level, or it would never be drawn: a set whose
@@ -253,31 +312,77 @@ final class Library {
     /// there and split the library in two. So before writing anything: if the folder is gone
     /// but its bookmark now points somewhere real, carry on there. The one in UserDefaults
     /// follows the move by itself, so the next launch agrees.
-    private func followMovedFolder() {
-        guard !FileManager.default.fileExists(atPath: folder.path(percentEncoded: false)),
-              let bookmark = folderBookmark
-        else { return }
+    ///
+    /// A folder moved to the Trash is not followed: saving there would keep editing a library
+    /// the user threw away, and writing to the old path would recreate it. Returns true while
+    /// that is where it is, and everything that writes files stops on it. It is looked at again
+    /// each time rather than remembered, so Put Back resumes saving by itself, and a move from
+    /// the Trash to a normal place is followed like any other.
+    ///
+    /// The notice is queued the first time only, so the many things that call this don't stack
+    /// alerts. A caller that is refusing something the user asked for passes `announce: false`
+    /// and speaks for itself every time.
+    @discardableResult
+    private func followMovedFolder(announce: Bool = true) -> Bool {
+        guard !FileManager.default.fileExists(atPath: folder.path(percentEncoded: false)) else {
+            warnedOfTrash = false
+            return false
+        }
+        guard let bookmark = folderBookmark else { return false }
         var isStale = false
         guard let moved = try? URL(
             resolvingBookmarkData: bookmark, options: .withoutUI, bookmarkDataIsStale: &isStale
         ), moved != folder,
         FileManager.default.fileExists(atPath: moved.path(percentEncoded: false))
-        else { return }
+        else { return false }
+        if Self.isInTrash(moved) {
+            if announce, !warnedOfTrash {
+                warnedOfTrash = true
+                notice = Self.inTrashNotice
+            }
+            return true
+        }
         folder = moved
+        // Whatever a scan found points at the old place.
+        check = nil
+        return false
+    }
+
+    private static let inTrashNotice = Notice(
+        title: "Your library is in the Trash",
+        message: "Changes won't be saved until it's put back: in the Trash, choose "
+            + "File ▸ Put Back. Or choose Settings ▸ Switch to open another library."
+    )
+
+    /// The Trash notice when the library is in the Trash, every time it is asked rather than
+    /// once, for the actions the user just tried and was turned down.
+    private func trashRefusal() -> Notice? {
+        followMovedFolder(announce: false) ? Self.inTrashNotice : nil
+    }
+
+    private static func isInTrash(_ url: URL) -> Bool {
+        guard let trash = try? FileManager.default.url(
+            for: .trashDirectory, in: .userDomainMask, appropriateFor: url, create: false
+        ) else { return false }
+        return isInside(url, trash)
     }
 
     private func save() {
-        guard !indexUnreadable else { return }
-        followMovedFolder()
+        guard !indexUnreadable, !followMovedFolder() else { return }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let data = try encoder.encode(
-                Index(sets: sets, icons: icons, licenses: licenses, smartSets: smartSets)
+                Index(
+                    sets: sets, icons: icons, licenses: licenses, smartSets: smartSets,
+                    lastBackup: lastBackup, backups: backupNames
+                )
             )
             try data.write(to: indexURL, options: .atomic)
+            // Now in the index, where it belongs to this library alone.
+            if lastBackup != nil { UserDefaults.standard.removeObject(forKey: Self.lastBackupKey) }
             // A new library's folder exists from its first save on; bookmark it then.
             if folderBookmark == nil { folderBookmark = try? folder.bookmarkData() }
         } catch {
@@ -640,21 +745,26 @@ final class Library {
     func renameSet(_ id: UUID, to name: String) {
         guard let index = sets.firstIndex(where: { $0.id == id }) else { return }
         recording("Rename Set") {
-            sets[index].name = name
+            sets[index].name = uniqueSetName(name, inside: sets[index].parentID, excluding: id)
             save()
         }
     }
 
     /// Moves a set, with everything inside it, under `parent`, or to the top level when nil. A set
     /// can't move into itself or into a set inside it.
-    func moveSet(_ id: UUID, into parent: UUID?) {
-        if let parent, subtree(of: id).contains(parent) { return }
-        guard let index = sets.firstIndex(where: { $0.id == id }) else { return }
+    /// Returns whether the set moved, so a drop that was refused can say so. A name the new
+    /// siblings already use is numbered, as a new set's would be.
+    @discardableResult
+    func moveSet(_ id: UUID, into parent: UUID?) -> Bool {
+        if let parent, subtree(of: id).contains(parent) { return false }
+        guard let index = sets.firstIndex(where: { $0.id == id }) else { return false }
         recording("Move Set") {
+            sets[index].name = uniqueSetName(sets[index].name, inside: parent, excluding: id)
             sets[index].parentID = parent
             if let parent { expandedSets.insert(parent) }
             save()
         }
+        return true
     }
 
     func beginNewSet(inside parent: UUID? = nil) {
@@ -774,8 +884,13 @@ final class Library {
     }
 
     /// Unique among its siblings only: "Outline" may sit inside both "Lucide" and "Heroicons".
-    private func uniqueSetName(_ name: String, inside parent: UUID?) -> String {
-        let taken = Set(sets.filter { $0.parentID == parent }.map { $0.name.lowercased() })
+    /// `excluding` is a set being renamed or moved, which must not clash with its own old name.
+    private func uniqueSetName(
+        _ name: String, inside parent: UUID?, excluding id: UUID? = nil
+    ) -> String {
+        let taken = Set(
+            sets.filter { $0.parentID == parent && $0.id != id }.map { $0.name.lowercased() }
+        )
         guard taken.contains(name.lowercased()) else { return name }
         var number = 2
         while taken.contains("\(name) \(number)".lowercased()) { number += 1 }
@@ -818,6 +933,8 @@ final class Library {
     @discardableResult
     private func recording<T>(_ name: String, _ change: () throws -> T) rethrows -> T {
         guard !isRecording else { return try change() }
+        // Icon files are written before save() would notice a move, so catch it before the edit.
+        followMovedFolder()
         isRecording = true
         defer { isRecording = false }
         let (icons0, sets0, licenses0, smart0) = (icons, sets, licenses, smartSets)
@@ -859,6 +976,19 @@ final class Library {
     /// what it had is put back (files out of the Trash). Registering the reverse lands it on
     /// the other of the undo manager's two stacks.
     private func apply(_ step: Step, undoing: Bool) {
+        // Moving files back would recreate the old path, or write into the Trash. The step is
+        // dropped: while the undo manager is undoing, anything registered lands on its redo
+        // stack and would still mean "undo", and it has no way to put a step back on the stack
+        // it came off. Registering nothing leaves the rest of the history coherent, and the
+        // notice says the step is gone.
+        guard !followMovedFolder(announce: false) else {
+            notice = Notice(
+                title: "Your library is in the Trash",
+                message: "Put it back in Finder (File ▸ Put Back) to keep working. Undo can't "
+                    + "reach files in the Trash, so that step can no longer be undone."
+            )
+            return
+        }
         var step = step
         let restored = undoing ? step.before : step.after
         let counterpart = undoing ? step.after : step.before
@@ -877,8 +1007,15 @@ final class Library {
         for icon in restored.icons {
             if !present.contains(icon.id) {
                 let file = fileURL(for: icon)
-                if let away = step.trashed.removeValue(forKey: icon.id) {
-                    do { try FileManager.default.moveItem(at: away, to: file) } catch {
+                if let away = step.trashed[icon.id] {
+                    // Forgotten only once it is back, or a failed move would lose track of the
+                    // file in the Trash. Redo then takes the icon out again without touching
+                    // the entry (there is no file to trash), and the next Undo finds it and
+                    // tries the move again.
+                    do {
+                        try FileManager.default.moveItem(at: away, to: file)
+                        step.trashed[icon.id] = nil
+                    } catch {
                         missing.append(icon.name)
                     }
                 } else if !FileManager.default.fileExists(
@@ -890,9 +1027,11 @@ final class Library {
             if let index = icons.firstIndex(where: { $0.id == icon.id }) {
                 var restoredIcon = icon
                 // Recently Used stamps happen outside any recording, so a stamp since this
-                // step was made isn't the step's to revert: keep the current date unless
-                // changing it is what the step did, as Clear Recently Used does.
-                if counterpartByID[icon.id]?.lastUsed == restoredIcon.lastUsed {
+                // step was made isn't the step's to revert. The counterpart holds the date the
+                // step left: while the icon still has it, nothing has stamped since and the
+                // step's own date comes back, as with Clear Recently Used. Any other date is
+                // newer than the step and stays.
+                if let left = counterpartByID[icon.id], icons[index].lastUsed != left.lastUsed {
                     restoredIcon.lastUsed = icons[index].lastUsed
                 }
                 icons[index] = restoredIcon
@@ -1142,14 +1281,19 @@ final class Library {
     /// when asked: the import-time duplicate check never sees what came before it or through an
     /// IconJar import.
     func checkLibrary() async {
-        guard !isChecking else { return }
+        guard !isChecking, !followMovedFolder() else { return }
         isChecking = true
+        let scanned = self.folder
         let snapshot = icons
         let folder = iconsFolder
-        check = await Task.detached(priority: .userInitiated) {
+        let result = await Task.detached(priority: .userInitiated) {
             Self.scan(icons: snapshot, folder: folder)
         }.value
         isChecking = false
+        // A switch or a move in Finder while it ran leaves results about a folder that is no
+        // longer this library's, and acting on them would trash or drop the wrong things.
+        guard self.folder == scanned else { return }
+        check = result
     }
 
     private nonisolated static func scan(icons: [Icon], folder: URL) -> LibraryCheck {
@@ -1158,7 +1302,10 @@ final class Library {
         var bySize: [Int: [(icon: Icon, url: URL)]] = [:]
         for icon in icons {
             let url = folder.appending(path: icon.fileName)
-            guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else {
+            // fileExists follows links; the size alone is the link's own, so a dangling one passes.
+            guard manager.fileExists(atPath: url.path(percentEncoded: false)),
+                  let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+            else {
                 check.missing.append(icon)
                 continue
             }
@@ -1210,6 +1357,7 @@ final class Library {
     /// that has turned up since the scan — undo, or a copy back into the folder — keeps its
     /// record.
     func removeMissingRecords() {
+        guard !followMovedFolder() else { return }
         let gone = (check?.missing ?? []).filter {
             !FileManager.default.fileExists(
                 atPath: fileURL(for: $0).path(percentEncoded: false)
@@ -1228,11 +1376,27 @@ final class Library {
     /// imported while the scan ran looks like an orphan to the snapshot, and trashing its
     /// file would break it with no undo.
     func trashOrphans() {
+        guard !followMovedFolder() else { return }
         let known = Set(icons.map(\.fileName))
+        var failed: [URL] = []
+        var firstError: Error?
         for url in check?.orphans ?? [] where !known.contains(url.lastPathComponent) {
-            try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            do {
+                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            } catch {
+                failed.append(url)
+                firstError = firstError ?? error
+            }
         }
-        check?.orphans = []
+        // What couldn't be moved stays listed, so it can be tried again.
+        check?.orphans = failed
+        if let firstError {
+            notice = Notice(
+                title: "Some files could not be moved to the Trash",
+                message: "\(plural(failed.count, "file")) couldn't be moved. "
+                    + firstError.localizedDescription
+            )
+        }
     }
 
     // MARK: Licences
@@ -1272,19 +1436,28 @@ final class Library {
     static let openRoot = FileManager.default.temporaryDirectory
         .appending(path: "IconeryOpen", directoryHint: .isDirectory)
 
+    /// The folder the last Quick Look press filled, so the next press can remove it.
+    @ObservationIgnored private var quickLookFolder: URL?
+
     /// Copies for Quick Look, named after the icons so the panel's title is the name rather
     /// than the library's id-named file, in the grid's order so its arrows walk the selection
-    /// as the grid shows it. Previewing isn't using, so Recently Used is left alone.
+    /// as the grid shows it. Previewing isn't using, so Recently Used is left alone. Each press
+    /// replaces the last one's folder instead of leaving another full set until relaunch, and
+    /// copyItem clones on APFS, where reading every file into memory cost 540 ms for 3,000.
     func quickLookURLs(for ids: Set<UUID>) -> [URL] {
         let shown = visibleIcons.filter { ids.contains($0.id) }
+        if let previous = quickLookFolder { try? FileManager.default.removeItem(at: previous) }
         let folder = Self.openRoot.appending(path: UUID().uuidString, directoryHint: .isDirectory)
-        let files: [ExportFile] = shown.compactMap { icon in
-            guard let data = try? Data(contentsOf: fileURL(for: icon)) else { return nil }
-            return ExportFile(
-                name: "\(Exporter.safeFileName(icon.name)).\(icon.kind.rawValue)", data: data
-            )
+        quickLookFolder = folder
+        guard (try? FileManager.default.createDirectory(
+            at: folder, withIntermediateDirectories: true
+        )) != nil else { return [] }
+        return shown.compactMap { icon in
+            let name = "\(Exporter.safeFileName(icon.name)).\(icon.kind.rawValue)"
+            let copy = Exporter.uniqueURL(for: name, in: folder)
+            return (try? FileManager.default.copyItem(at: fileURL(for: icon), to: copy)) != nil
+                ? copy : nil
         }
-        return (try? Exporter.write(files, to: folder)) ?? []
     }
 
     /// Opens a copy named after the icon, so the other app shows its name rather than the
@@ -1332,11 +1505,12 @@ final class Library {
     /// go into `target`, or into "Unsorted" when no set is selected.
     @discardableResult
     func importItems(_ urls: [URL], into target: UUID?) -> ImportReport {
-        recording("Import") { importItemsNow(urls, into: target) }
+        // Copying icons in would recreate the old path, or land them in the Trash.
+        guard !followMovedFolder() else { return ImportReport() }
+        return recording("Import") { importItemsNow(urls, into: target) }
     }
 
     private func importItemsNow(_ urls: [URL], into target: UUID?) -> ImportReport {
-        followMovedFolder()  // icon files are written before save() would notice a move
         var report = ImportReport()
         duplicates = preferences.skipsDuplicates ? DuplicateFinder(files: icons.map(fileURL)) : nil
         defer { duplicates = nil }
@@ -1439,6 +1613,10 @@ final class Library {
         let files = urls.filter { !IconJarLibrary.isLibrary($0) }
         guard !files.isEmpty else { return !jars.isEmpty || !backups.isEmpty }
 
+        if let refusal = trashRefusal() {
+            notice = refusal
+            return false
+        }
         let report = importItems(files, into: target)
         if report.createdSets.count == 1 { sidebar = .set(report.createdSets[0]) }
         var lines: [String] = []
@@ -1483,8 +1661,7 @@ final class Library {
         // own subtree. Anywhere without a set under it, nothing happens.
         if let dragged = urls.compactMap(Self.draggedSetID).first {
             guard let setID, dragged != setID else { return false }
-            moveSet(dragged, into: setID)
-            return true
+            return moveSet(dragged, into: setID)
         }
         guard Self.isGridDrag(urls) else { return importAndReport(urls, into: setID) }
         guard let setID, let ids = draggingIDs else { return false }
@@ -1510,7 +1687,12 @@ final class Library {
         }
     }
 
-    private func add(_ url: URL, to setID: UUID, report: inout ImportReport) {
+    private func add(_ link: URL, to setID: UUID, report: inout ImportReport) {
+        // Icon themes like Papirus and Breeze alias icons with symlinks. Copying one as a link
+        // leaves a dangling link here, or one that dies with its source, so everything below
+        // reads and copies the file it points at. The name stays the link's own; the kind comes
+        // from the target, or `a.png -> a.svg` would be stored as a .png holding SVG.
+        let url = link.resolvingSymlinksInPath()
         // Duplicates first: checking one reads the file at most, and decoding it costs more.
         if IconKind(url: url) != nil, duplicates?.contains(url) == true {
             report.duplicates += 1
@@ -1519,14 +1701,14 @@ final class Library {
         guard let kind = IconKind(url: url), let image = NSImage(contentsOf: url),
               image.isValid, image.size.width > 0, image.size.height > 0
         else {
-            report.skipped.append(url.lastPathComponent)
+            report.skipped.append(link.lastPathComponent)
             return
         }
-        let stem = url.deletingPathExtension().lastPathComponent
+        let stem = link.deletingPathExtension().lastPathComponent
         var icon = Icon(name: stem, setID: setID, kind: kind)
         icon.originalName = stem
         if kind == .svg, preferences.readsSVGTitles,
-           let text = try? String(contentsOf: url, encoding: .utf8) {
+           let text = (try? Data(contentsOf: url)).flatMap(Self.svgText) {
             let named = SVGCleaner.titleAndDescription(of: text)
             if let title = named.title { icon.name = title }
             // Sketch and Figma write "Created with …" there, which describes nothing.
@@ -1541,7 +1723,7 @@ final class Library {
             duplicates?.insert(url)
             report.imported += 1
         } catch {
-            report.skipped.append("\(url.lastPathComponent) (\(error.localizedDescription))")
+            report.skipped.append("\(link.lastPathComponent) (\(error.localizedDescription))")
         }
     }
 
@@ -1550,9 +1732,9 @@ final class Library {
     /// skipped would leave it standing empty.
     private func looseFilesSetID(report: inout ImportReport) -> UUID {
         if let id = preferences.looseFilesSetID, sets.contains(where: { $0.id == id }) { return id }
-        if let id = sets.first(where: { $0.name == "Unsorted" && $0.parentID == nil })?.id {
-            return id
-        }
+        // Without case, as uniqueSetName compares, or "unsorted" would breed "Unsorted 2", 3 ….
+        let unsorted = sets.first { $0.name.lowercased() == "unsorted" && $0.parentID == nil }
+        if let id = unsorted?.id { return id }
         let id = makeSet(named: "Unsorted", inside: nil).id
         report.allCreated.append(id)
         return id
@@ -1585,6 +1767,7 @@ final class Library {
 
     /// Imports and describes how it went, for whichever window asked to show it.
     func importIconJarWithNotice(_ library: URL, into target: UUID?) -> Notice {
+        if let refusal = trashRefusal() { return refusal }
         let setsBefore = sets.count
         do {
             let report = try importIconJar(library, into: target)
@@ -1611,7 +1794,8 @@ final class Library {
     /// identifier, so importing the same library again adds only what is new since.
     @discardableResult
     func importIconJar(_ library: URL, into target: UUID?) throws -> ImportReport {
-        try recording("Import") { try importIconJarNow(library, into: target) }
+        guard !followMovedFolder() else { return ImportReport() }
+        return try recording("Import") { try importIconJarNow(library, into: target) }
     }
 
     private func importIconJarNow(_ library: URL, into target: UUID?) throws -> ImportReport {
@@ -1665,11 +1849,12 @@ final class Library {
             let id = UUID(uuidString: item.uuid) ?? UUID()
             guard known.insert(id).inserted else { continue }
             let stem = file.deletingPathExtension().lastPathComponent
-            let icon = Icon(
+            var icon = Icon(
                 id: id, name: item.name.flatMap { $0.isEmpty ? nil : $0 } ?? stem,
                 setID: collection.set, kind: kind, tags: item.tags, starred: item.starred,
                 added: item.added ?? .now, lastUsed: item.lastUsed
             )
+            icon.originalName = stem
             do {
                 try FileManager.default.copyItem(at: file, to: fileURL(for: icon))
                 added.append(icon)
@@ -1695,8 +1880,19 @@ final class Library {
     struct Problem: LocalizedError {
         var errorDescription: String?
 
+        static let backupInTrash = Problem(
+            errorDescription: "The backup folder is in the Trash. Put it back, or choose another "
+                + "in Settings."
+        )
+
         static let backupInsideLibrary = Problem(
             errorDescription: "Backups can't be kept inside the library they back up."
+        )
+
+        /// The folder chosen for backups is gone, and the default one is not what was chosen.
+        static let backupFolderMissing = Problem(
+            errorDescription: "The backup folder couldn't be found. It may be on a drive that "
+                + "isn't connected. Connect it, or choose another in Settings."
         )
 
         /// The backup is zipping the library folder, which mustn't move or change under it.
@@ -1718,9 +1914,19 @@ final class Library {
             .appending(path: "Iconery", directoryHint: .isDirectory)
     }
 
+    private static let backupFolderMissingNotice = Notice(
+        title: "Your backup folder couldn't be found",
+        message: "It may be on a drive that isn't connected, or it was moved to the Trash. "
+            + "Scheduled backups are paused until it's back, or until you choose another folder "
+            + "in Settings."
+    )
+
     nonisolated static let libraryKey = "libraryLocation"
     nonisolated static let backupKey = "backupLocation"
     nonisolated static let lastBackupKey = "lastBackup"
+    /// Hidden file a backup folder gets once its older backups have been adopted. See
+    /// `adoptLegacyBackups(in:)`.
+    nonisolated static let adoptionMarkerName = ".iconery-adopted"
     nonisolated static let exportKey = "exportLocation"
 
     /// Locations are kept as bookmarks rather than paths, so a folder renamed or moved in Finder
@@ -1732,6 +1938,14 @@ final class Library {
             resolvingBookmarkData: bookmark, options: .withoutUI, bookmarkDataIsStale: &isStale
         ) else { return nil }
         if isStale { remember(url, as: key) }
+        return url
+    }
+
+    /// The backup folder chosen in Settings, or nil when it can't be found or has been thrown
+    /// away: the bookmark follows it into the Trash, where backups would be written and pruned
+    /// out of sight.
+    private static func storedBackupFolder() -> URL? {
+        guard let url = storedURL(backupKey), !isInTrash(url) else { return nil }
         return url
     }
 
@@ -1760,7 +1974,15 @@ final class Library {
         }
         save()
         let target = Exporter.uniqueURL(for: "Iconery Library", in: destination)
-        try FileManager.default.moveItem(at: folder, to: target)
+        // A library folder that is a link (say to Dropbox) would otherwise have only the link
+        // renamed, leaving the library where it was behind a link that points nowhere new.
+        let link = folder
+        let isLink = (try? link.resourceValues(forKeys: [.isSymbolicLinkKey]))?
+            .isSymbolicLink == true
+        try FileManager.default.moveItem(at: link.resolvingSymlinksInPath(), to: target)
+        if isLink, !FileManager.default.fileExists(atPath: link.path(percentEncoded: false)) {
+            try? FileManager.default.removeItem(at: link)  // it points at nothing now
+        }
         folder = target
         folderBookmark = try? target.bookmarkData()
         Self.remember(target, as: Self.libraryKey)
@@ -1780,6 +2002,9 @@ final class Library {
         save()
         folder = url
         folderBookmark = try? url.bookmarkData()
+        // Results and warnings about the library left behind aren't this one's.
+        check = nil
+        warnedOfTrash = false
         sets = []
         licenses = License.starters
         icons = []
@@ -1802,7 +2027,28 @@ final class Library {
             throw Problem.backupInsideLibrary
         }
         backupFolder = url
+        backupFolderMissing = false
         Self.remember(url, as: Self.backupKey)
+    }
+
+    /// Looks again for the backup folder chosen in Settings and returns whether it is there.
+    /// Done before every backup into it, not just after it went missing, because it can be
+    /// renamed, moved or thrown away while the app runs, and writing to the remembered path
+    /// would make a new folder there. A move or rename is followed; a folder that is gone or in
+    /// the Trash pauses backups. True, with nothing to do, when none was ever chosen.
+    private func resolveBackupFolder() -> Bool {
+        guard UserDefaults.standard.data(forKey: Self.backupKey) != nil else { return true }
+        guard let url = Self.storedBackupFolder() else {
+            if !backupFolderMissing { notice = Self.backupFolderMissingNotice }
+            backupFolderMissing = true
+            return false
+        }
+        if url != backupFolder || backupFolderMissing {
+            backupFolder = url
+            Self.remember(url, as: Self.backupKey)
+        }
+        backupFolderMissing = false
+        return true
     }
 
     // MARK: Backup
@@ -1826,7 +2072,16 @@ final class Library {
     /// declared in Info.plist as conforming to zip, so Archive Utility still unpacks it.
     @discardableResult
     func backUp(into destination: URL) async throws -> URL {
+        var destination = destination
+        // Asked for the folder Settings shows: make sure it is still where it was, and when it
+        // is the default one standing in for a chosen folder that is gone, write there only if
+        // the chosen one has come back.
+        if destination == backupFolder {
+            guard resolveBackupFolder() else { throw Problem.backupFolderMissing }
+            destination = backupFolder
+        }
         guard !Self.isInside(destination, folder) else { throw Problem.backupInsideLibrary }
+        guard !Self.isInTrash(destination) else { throw Problem.backupInTrash }
         guard !isBackingUp else {
             throw Problem(errorDescription: "A backup is already being written.")
         }
@@ -1841,29 +2096,72 @@ final class Library {
         let url = Exporter.uniqueURL(for: name, in: destination)
         try await writeBackup(to: url)
         lastBackup = .now
-        UserDefaults.standard.set(lastBackup, forKey: Self.lastBackupKey)
-        Self.pruneBackups(in: destination, keeping: preferences.backupsKept)
+        backupNames.append(url.lastPathComponent)
+        adoptLegacyBackups(in: destination)
+        let trashed = Self.pruneBackups(
+            in: destination, keeping: preferences.backupsKept, owned: Set(backupNames)
+        )
+        // Also the names whose file is gone from this folder, deleted by hand in Finder or
+        // written to another backup folder: pruning can never trash those, so they would pile
+        // up in library.json for good.
+        let present = Set(Self.backupFiles(in: destination).map(\.url.lastPathComponent))
+        backupNames.removeAll { trashed.contains($0) || !present.contains($0) }
+        save()
         return url
+    }
+
+    /// Backups from before each library kept its own list sit in the folder with nobody's name
+    /// on them. The first library to back up into a folder takes them all, so they go on being
+    /// pruned instead of piling up; anything later is told apart by the lists. A marker file in
+    /// the folder says it has been done, so it holds per folder rather than per Mac, follows the
+    /// folder if it is moved and syncs with it in iCloud Drive. If the marker can't be written
+    /// the next library adopts again, which only means it may take another's recent backups.
+    private func adoptLegacyBackups(in destination: URL) {
+        let marker = destination.appending(path: Self.adoptionMarkerName)
+        guard !FileManager.default.fileExists(atPath: marker.path(percentEncoded: false))
+        else { return }
+        let known = Set(backupNames)
+        backupNames += Self.backupFiles(in: destination)
+            .map(\.url.lastPathComponent)
+            .filter { !known.contains($0) }
+        try? Data().write(to: marker)
     }
 
     /// Zips the library folder exactly as it sits on disk (the index plus every icon file), so
     /// sets, nesting, tags and stars all survive and a restore is a straight swap back. `ditto`
     /// because it ships with macOS and Foundation has no zip writer. It runs while the window
     /// stays responsive: a library of large ICNS files takes a while to zip.
-    func writeBackup(to url: URL) async throws {
+    func writeBackup(to url: URL, snapshotsIn parent: URL? = nil) async throws {
         save()  // the index on disk now matches what the window shows
         // The window staying responsive also means an import or delete can land mid-zip, and
         // ditto would archive half of each. So ditto reads a snapshot: copyItem clones on
         // APFS, and nothing else runs on this actor until the copy returns, so the snapshot
-        // is the library at one instant.
-        let snapshotRoot = FileManager.default.temporaryDirectory
+        // is the library at one instant. It is made on the library's own volume when that volume
+        // can clone, because a clone can't cross volumes: a library on an external APFS drive
+        // would otherwise be copied byte by byte to the boot disk, and a big one takes that
+        // long with the window waiting. Where it can't (exFAT, SMB) the copy is a full one
+        // either way, and making it there would need the library's size free on that volume
+        // again, so it goes to the temporary folder instead.
+        //
+        // `parent` is for tests, which rely on it as they do on init's `folder:`: the other
+        // places are hidden from a listing (TemporaryItems is behind a privacy prompt), so a
+        // test could not see whether a failed copy left its snapshot behind.
+        let clones = parent == nil
+            && (try? folder.resourceValues(forKeys: [.volumeSupportsFileCloningKey]))?
+            .volumeSupportsFileCloning == true
+        let onLibraryVolume = clones ? (try? FileManager.default.url(
+            for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: folder,
+            create: true
+        )) : nil
+        let snapshotRoot = onLibraryVolume ?? (parent ?? FileManager.default.temporaryDirectory)
             .appending(path: "iconery-snapshot-\(UUID().uuidString)")
         let snapshot = snapshotRoot.appending(path: folder.lastPathComponent)
         try FileManager.default.createDirectory(
             at: snapshotRoot, withIntermediateDirectories: true
         )
-        try FileManager.default.copyItem(at: folder, to: snapshot)
+        // Registered before the copy: one that fails part way leaves a half-made snapshot.
         defer { try? FileManager.default.removeItem(at: snapshotRoot) }
+        try FileManager.default.copyItem(at: folder, to: snapshot)
         // ditto's complaints go to a file rather than a pipe, which a long one could fill and
         // stall.
         let log = FileManager.default.temporaryDirectory
@@ -1902,37 +2200,58 @@ final class Library {
 
     /// Moves backups in `folder` past the newest `keep` to the Trash, where they can still be
     /// fished out. Leftover ".partial" files go too: one survives only when the app died
-    /// mid-backup, nothing else ever removes it, and this runs only after a backup has
-    /// finished, so the partial in flight has already been renamed away.
-    static func pruneBackups(in folder: URL, keeping keep: Int) {
-        for old in backupsToPrune(in: folder, keeping: keep) {
-            try? FileManager.default.trashItem(at: old, resultingItemURL: nil)
+    /// mid-backup, and nothing else ever removes it. This library's own in-flight partial has
+    /// already been renamed away, but a shared folder (iCloud) may hold another Mac's or
+    /// library's, which ditto is still writing; one touched within the last hour is left.
+    /// Only backups named in `owned` count, so another library's, or a user's own file with a
+    /// name like one, is never trashed. Returns the names it trashed.
+    @discardableResult
+    static func pruneBackups(in folder: URL, keeping keep: Int, owned: Set<String>) -> [String] {
+        var trashed: [String] = []
+        for old in backupsToPrune(in: folder, keeping: keep, owned: owned) {
+            if (try? FileManager.default.trashItem(at: old, resultingItemURL: nil)) != nil {
+                trashed.append(old.lastPathComponent)
+            }
         }
+        let stale = Date.now.addingTimeInterval(-60 * 60)
         let leftovers = ((try? FileManager.default.contentsOfDirectory(
-            at: folder, includingPropertiesForKeys: nil
+            at: folder, includingPropertiesForKeys: [.contentModificationDateKey]
         )) ?? [])
             .filter {
-                $0.lastPathComponent.hasPrefix("Iconery Backup ")
-                    && $0.pathExtension == "partial"
+                let modified = try? $0.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate
+                return $0.lastPathComponent.hasPrefix("Iconery Backup ")
+                    && $0.pathExtension == "partial" && (modified ?? .distantPast) < stale
             }
         for leftover in leftovers {
             try? FileManager.default.trashItem(at: leftover, resultingItemURL: nil)
         }
+        return trashed
     }
 
-    /// The backups in `folder` older than the newest `keep`, ordered by the date in the name.
-    /// Only names exactly the way `backUp(into:)` writes them count — a prefix match alone
-    /// would let any "Iconery Backup …" file of the user's own sort as the newest and push a
+    /// The backups in `owned` that are in `folder` and older than the newest `keep`, ordered by
+    /// the date in the name. Only names exactly the way `backUp(into:)` writes them count — a
+    /// prefix match alone would let any "Iconery Backup …" file of the user's own sort as the newest and push a
     /// real backup out. The names sort as text until two backups land in the same second and
     /// `uniqueURL` adds " 2": a space sorts before a dot, so plain sorting would call the
     /// newer file older and trash it first; the counter is compared as the number it is.
     /// Backups made before they had their own type ended in .zip, and still count.
     /// 0 keeps everything.
-    nonisolated static func backupsToPrune(in folder: URL, keeping keep: Int) -> [URL] {
+    nonisolated static func backupsToPrune(
+        in folder: URL, keeping keep: Int, owned: Set<String>
+    ) -> [URL] {
         guard keep > 0 else { return [] }
+        let backups = backupFiles(in: folder).filter { owned.contains($0.url.lastPathComponent) }
+        return backups.dropLast(keep).map(\.url)
+    }
+
+    /// Every backup in `folder` named exactly as `backUp(into:)` names them, oldest first.
+    nonisolated static func backupFiles(
+        in folder: URL
+    ) -> [(url: URL, stamp: Substring, clash: Int)] {
         let name =
             /^Iconery Backup (\d{4}-\d{2}-\d{2} at \d{2}\.\d{2}\.\d{2})(?: (\d+))?\.(?i:iconerybackup|zip)$/
-        let backups = ((try? FileManager.default.contentsOfDirectory(
+        return ((try? FileManager.default.contentsOfDirectory(
             at: folder, includingPropertiesForKeys: nil
         )) ?? [])
             .compactMap { url -> (url: URL, stamp: Substring, clash: Int)? in
@@ -1940,7 +2259,6 @@ final class Library {
                 return (url, match.1, match.2.flatMap { Int($0) } ?? 0)
             }
             .sorted { ($0.stamp, $0.clash) < ($1.stamp, $1.clash) }
-        return backups.dropLast(keep).map(\.url)
     }
 
     /// Backs up whenever the schedule in Settings says one is due: first shortly after launch,
@@ -1957,8 +2275,11 @@ final class Library {
         // Never while the default library is standing in for one that couldn't be found:
         // its backups would land beside the real library's and prune them to make room.
         guard let interval = preferences.backupSchedule.interval, !isBackingUp,
-              !openedFallbackLibrary
+              !openedFallbackLibrary, !followMovedFolder()
         else { return }
+        // A chosen folder that was unplugged is looked for again each time, so backups resume
+        // by themselves when it's back; the alert at launch said they were paused.
+        guard resolveBackupFolder() else { return }
         if let lastBackup, Date.now.timeIntervalSince(lastBackup) < interval { return }
         do {
             try await backUp(into: backupFolder)
@@ -2015,9 +2336,10 @@ final class Library {
     func savePreset(named name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
+        // No prefix or suffix: the form's own apply on top of every preset, so keeping a copy
+        // here would write them twice.
         let output = PresetOutput(
-            format: export.format, sizes: export.sizes, prefix: export.prefix,
-            suffix: export.suffix, includeSize: export.includeSize
+            format: export.format, sizes: export.sizes, includeSize: export.includeSize
         )
         let preset = ExportPreset(
             id: UUID().uuidString, name: name, platform: nil, outputs: [output]
@@ -2075,6 +2397,7 @@ final class Library {
     func export(_ icons: [Icon], to folder: URL) -> (written: [URL], problems: [String]) {
         var written: [URL] = []
         var problems: [String] = []
+        var exported: Set<UUID> = []
         for icon in icons {
             do {
                 let destination = preferences.keepsSetFolders
@@ -2086,11 +2409,14 @@ final class Library {
                     }
                 }
                 written += urls
+                if !urls.isEmpty { exported.insert(icon.id) }
             } catch {
                 problems.append("\(icon.name): \(error.localizedDescription)")
             }
         }
-        update(Set(icons.map(\.id))) { $0.lastUsed = .now }
+        // Only icons that reached the disk were used; a failed one would otherwise jump into
+        // Recently Used with nothing to show for it.
+        update(exported) { $0.lastUsed = .now }
         return (written, problems)
     }
 
@@ -2153,11 +2479,23 @@ final class Library {
         return written.map { NSItemProvider(contentsOf: $0) ?? NSItemProvider() }
     }
 
+    /// SVG source as text: UTF-8, or UTF-16 with or without a byte order mark. Editors on
+    /// Windows save the latter, and AppKit draws it, so reading only UTF-8 would fail on an icon
+    /// that imported and shows fine. UTF-16 without a mark is also valid UTF-8, with a NUL after
+    /// every ASCII character, so a UTF-8 reading that holds one is taken as UTF-16 instead.
+    /// Foundation assumes big-endian when there's no mark, so little-endian is said outright:
+    /// "<" then a NUL as the first two bytes.
+    private nonisolated static func svgText(_ data: Data) -> String? {
+        if let text = String(data: data, encoding: .utf8), !text.contains("\0") { return text }
+        let littleEndian = data.first.map { $0 != 0 } == true && data.dropFirst().first == 0
+        return String(data: data, encoding: littleEndian ? .utf16LittleEndian : .utf16)
+    }
+
     /// The icon's SVG source, for pasting straight into an editor or a design tool. The file as
     /// it is, not the cleaned-up copy an SVG export can write.
     func copySVGCode(_ icon: Icon) {
         guard icon.kind == .svg, let data = try? Data(contentsOf: fileURL(for: icon)),
-              let text = String(data: data, encoding: .utf8)
+              let text = Self.svgText(data)
         else {
             notice = Notice(
                 title: "“\(icon.name)” could not be copied",
@@ -2186,22 +2524,22 @@ final class Library {
         _ items: [Icon], under root: URL, name: String, leftOutOf what: String
     ) -> (folder: URL, written: [URL]) {
         let folder = root.appending(path: UUID().uuidString).appending(path: name)
-        var written: [URL] = []
+        let settings = activePreset.map { export.outputs(of: $0) } ?? [export]
+        let drawn = Exporter.transferFiles(
+            items.map { ($0, fileURL(for: $0)) }, settings: settings
+        )
+        // Names are decided in selection order before anything is written, so a clash is renamed
+        // the same way whichever core finished first.
         var missing: [String] = []
-        for item in items {
-            let files: [ExportFile]
-            if let exported = try? exportFiles(for: item) {
-                files = exported
-            } else if let data = try? Data(contentsOf: fileURL(for: item)) {
-                files = [ExportFile(
-                    name: "\(Exporter.safeFileName(item.name)).\(item.kind.rawValue)", data: data
-                )]
-            } else {
+        var batches: [[ExportFile]] = []
+        for (item, files) in zip(items, drawn) {
+            guard let files else {
                 missing.append(item.name)
                 continue
             }
-            written += (try? Exporter.write(files, to: folder)) ?? []
+            batches.append(files)
         }
+        let written = Exporter.write(batches: batches, to: folder).flatMap { $0 }
         if !missing.isEmpty {
             notice = Notice(
                 title: "Some icons were left out of \(what)",
@@ -2231,9 +2569,10 @@ private struct DuplicateFinder {
         guard let size = Self.size(of: url), let sameSize = bySize[size],
               let hash = hash(of: url)
         else { return false }
-        for other in sameSize where other != url {
-            if self.hash(of: other) == hash { return true }
-        }
+        // A file may match itself: dragging a library file back in (Reveal in Finder, then drop)
+        // must count as a duplicate. Nothing is lost by it, since a URL is only checked before
+        // it is inserted, and Check Library hashes with its own code.
+        for other in sameSize where self.hash(of: other) == hash { return true }
         return false
     }
 

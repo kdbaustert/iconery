@@ -144,6 +144,9 @@ struct IconGridView: View {
             // the grid shows nested sets' icons too, and "move to the set being viewed" would
             // quietly pull one out of its set. Moves go through the sidebar's rows.
             guard !Library.isGridDrag(urls) else { return false }
+            // A sidebar set released over the grid has no set under it: handleDrop would nest
+            // it into the one being viewed. Refusing sends the drag back.
+            guard !urls.contains(where: { $0.scheme == "iconery-set" }) else { return false }
             return library.handleDrop(urls, onto: library.currentSetID)
         } isTargeted: { isDropTarget = $0 }
         .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar(count: icons.count) }
@@ -351,6 +354,7 @@ private struct IconMenu: View {
             library.selection = targets
             library.exportSelection()
         }
+        .disabled(!library.canExport)
         Divider()
         if targets.count == 1 {
             Button("Rename…") { library.beginRename(icon) }
