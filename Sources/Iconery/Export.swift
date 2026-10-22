@@ -113,7 +113,7 @@ struct ExportOptions: Codable, Equatable {
     private static let defaultsKey = "exportOptions"
 
     static func load() -> ExportOptions {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+        guard let data = Library.defaults.data(forKey: defaultsKey),
               var options = try? JSONDecoder().decode(ExportOptions.self, from: data)
         else { return ExportOptions() }
         options.pngSizes.sort()
@@ -124,7 +124,7 @@ struct ExportOptions: Codable, Equatable {
 
     func save() {
         guard let data = try? JSONEncoder().encode(self) else { return }
-        UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        Library.defaults.set(data, forKey: Self.defaultsKey)
     }
 }
 
@@ -290,15 +290,15 @@ struct ExportPreset: Identifiable, Codable, Hashable {
                   withJSONObject: current + unreadable.map(\.object)
               )
         else {
-            UserDefaults.standard.set(data, forKey: defaultsKey)
+            Library.defaults.set(data, forKey: defaultsKey)
             return
         }
-        UserDefaults.standard.set(merged, forKey: defaultsKey)
+        Library.defaults.set(merged, forKey: defaultsKey)
     }
 
     /// The saved array's elements, each as parsed JSON and as its own bytes.
     private static func stored() -> [(object: Any, data: Data)] {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+        guard let data = Library.defaults.data(forKey: defaultsKey),
               let items = try? JSONSerialization.jsonObject(with: data) as? [Any]
         else { return [] }
         return items.compactMap { item in
@@ -454,7 +454,7 @@ enum Exporter {
     }
 
     /// Where drags out of the grid are exported to. Emptied at launch.
-    static let dragRoot = FileManager.default.temporaryDirectory
+    nonisolated(unsafe) static var dragRoot = FileManager.default.temporaryDirectory
         .appending(path: "IconeryDrag", directoryHint: .isDirectory)
 
     /// Every name exporting `icon` writes with `preset` active, or with `options` alone when

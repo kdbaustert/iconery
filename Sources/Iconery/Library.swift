@@ -152,7 +152,7 @@ final class Library {
         let storedBackupFolder = Self.storedBackupFolder()
         backupFolder = storedBackupFolder ?? Self.defaultBackupFolder
         backupFolderMissing = storedBackupFolder == nil
-            && UserDefaults.standard.data(forKey: Self.backupKey) != nil
+            && Self.defaults.data(forKey: Self.backupKey) != nil
         // nil for a library that has never been saved; the first save takes one instead.
         folderBookmark = try? self.folder.bookmarkData()
         let hadIndex = FileManager.default.fileExists(
@@ -170,7 +170,7 @@ final class Library {
         }
         expandedSets = Set(preferences.expandedSetIDs.compactMap(UUID.init(uuidString:)))
             .intersection(known)
-        let hadLocation = UserDefaults.standard.data(forKey: Self.libraryKey) != nil
+        let hadLocation = Self.defaults.data(forKey: Self.libraryKey) != nil
         if folder == nil, hadLocation, remembered == nil {
             // The location is kept, so the library opens again once its drive is back.
             openedFallbackLibrary = true
@@ -185,7 +185,7 @@ final class Library {
         // can never be mistaken for another library's. Not the stand-in for a missing library,
         // and not a brand-new one: neither is the library those backups were made of.
         if lastBackup == nil, hadIndex, !openedFallbackLibrary {
-            lastBackup = UserDefaults.standard.object(forKey: Self.lastBackupKey) as? Date
+            lastBackup = Self.defaults.object(forKey: Self.lastBackupKey) as? Date
         }
         if backupFolderMissing {
             notice = Self.backupFolderMissingNotice
@@ -382,7 +382,7 @@ final class Library {
             )
             try data.write(to: indexURL, options: .atomic)
             // Now in the index, where it belongs to this library alone.
-            if lastBackup != nil { UserDefaults.standard.removeObject(forKey: Self.lastBackupKey) }
+            if lastBackup != nil { Self.defaults.removeObject(forKey: Self.lastBackupKey) }
             // A new library's folder exists from its first save on; bookmark it then.
             if folderBookmark == nil { folderBookmark = try? folder.bookmarkData() }
         } catch {
@@ -1433,7 +1433,7 @@ final class Library {
     // MARK: Open In
 
     /// Where Open In puts its copies. Emptied at launch.
-    static let openRoot = FileManager.default.temporaryDirectory
+    nonisolated(unsafe) static var openRoot = FileManager.default.temporaryDirectory
         .appending(path: "IconeryOpen", directoryHint: .isDirectory)
 
     /// The folder the last Quick Look press filled, so the next press can remove it.
@@ -1928,11 +1928,13 @@ final class Library {
     /// `adoptLegacyBackups(in:)`.
     nonisolated static let adoptionMarkerName = ".iconery-adopted"
     nonisolated static let exportKey = "exportLocation"
+    /// Where locations, the last backup and export settings are kept. Tests point it at a suite.
+    nonisolated(unsafe) static var defaults: UserDefaults = .standard
 
     /// Locations are kept as bookmarks rather than paths, so a folder renamed or moved in Finder
     /// is still found.
     private static func storedURL(_ key: String) -> URL? {
-        guard let bookmark = UserDefaults.standard.data(forKey: key) else { return nil }
+        guard let bookmark = Self.defaults.data(forKey: key) else { return nil }
         var isStale = false
         guard let url = try? URL(
             resolvingBookmarkData: bookmark, options: .withoutUI, bookmarkDataIsStale: &isStale
@@ -1950,7 +1952,7 @@ final class Library {
     }
 
     private static func remember(_ url: URL, as key: String) {
-        UserDefaults.standard.set(try? url.bookmarkData(), forKey: key)
+        Self.defaults.set(try? url.bookmarkData(), forKey: key)
     }
 
     /// Whether `url` is `folder` itself or anywhere inside it.
@@ -2037,7 +2039,7 @@ final class Library {
     /// would make a new folder there. A move or rename is followed; a folder that is gone or in
     /// the Trash pauses backups. True, with nothing to do, when none was ever chosen.
     private func resolveBackupFolder() -> Bool {
-        guard UserDefaults.standard.data(forKey: Self.backupKey) != nil else { return true }
+        guard Self.defaults.data(forKey: Self.backupKey) != nil else { return true }
         guard let url = Self.storedBackupFolder() else {
             if !backupFolderMissing { notice = Self.backupFolderMissingNotice }
             backupFolderMissing = true
@@ -2358,7 +2360,7 @@ final class Library {
         if let url {
             Self.remember(url, as: Self.exportKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: Self.exportKey)
+            Self.defaults.removeObject(forKey: Self.exportKey)
         }
     }
 

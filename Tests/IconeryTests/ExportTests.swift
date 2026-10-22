@@ -7,21 +7,31 @@ import XCTest
 
 final class ExportTests: XCTestCase {
     private var folder: URL!
+    private var suiteName: String!
+    private var savedDefaults: UserDefaults!
+    private var savedDragRoot: URL!
+    private var savedOpenRoot: URL!
 
     override func setUpWithError() throws {
         folder = FileManager.default.temporaryDirectory
             .appending(path: "IconeryTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // Library.init empties both staging folders, which the installed app also uses.
+        suiteName = "IconeryTests-\(UUID().uuidString)"
+        savedDefaults = Library.defaults
+        savedDragRoot = Exporter.dragRoot
+        savedOpenRoot = Library.openRoot
+        Library.defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        Exporter.dragRoot = folder.appending(path: "Drag", directoryHint: .isDirectory)
+        Library.openRoot = folder.appending(path: "Open", directoryHint: .isDirectory)
     }
 
     override func tearDownWithError() throws {
+        Library.defaults.removePersistentDomain(forName: suiteName)
+        Library.defaults = savedDefaults
+        Exporter.dragRoot = savedDragRoot
+        Library.openRoot = savedOpenRoot
         try? FileManager.default.removeItem(at: folder)
-        // Moving, switching and backing up remember locations; these are the test runner's
-        // defaults, not the app's, but leave them as found.
-        let exportKeys = ["exportOptions", "exportPresets"]
-        for key in [Library.libraryKey, Library.backupKey, Library.lastBackupKey] + exportKeys {
-            UserDefaults.standard.removeObject(forKey: key)
-        }
     }
 
     @MainActor
@@ -44,7 +54,7 @@ final class ExportTests: XCTestCase {
 
     @MainActor
     func testFaintOneColourIconsAreRedrawnOnScreenOnly() throws {
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let set = library.createSet(named: "Set")
         let stroke = ##"<path d="M3 10l9-7 9 7v10H3z" stroke-width="3" stroke="#"##
         library.importItems([
@@ -133,7 +143,7 @@ final class ExportTests: XCTestCase {
     func testMovingTheLibraryTakesEverythingAlong() throws {
         let (_, source) = try makeSVGIcon()
         let original = folder.appending(path: "Library")
-        let library = Library(folder: original)
+        let library = Library(folder: original, preferences: preferences())
         library.importItems([source], into: library.createSet(named: "Set").id)
         let elsewhere = folder.appending(path: "Elsewhere")
         try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
@@ -144,7 +154,7 @@ final class ExportTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: original.path(percentEncoded: false)))
         XCTAssertNotNil(library.image(for: try XCTUnwrap(library.icons.first)),
                         "icons are read from the new place")
-        XCTAssertEqual(Library(folder: library.folder).icons.count, 1)
+        XCTAssertEqual(Library(folder: library.folder, preferences: preferences()).icons.count, 1)
         XCTAssertThrowsError(try library.moveLibrary(into: library.iconsFolder),
                              "a library can't move into itself")
     }
@@ -152,9 +162,9 @@ final class ExportTests: XCTestCase {
     @MainActor
     func testSwitchingOpensAnotherLibraryButNotAPlainFolder() throws {
         let (_, source) = try makeSVGIcon()
-        let other = Library(folder: folder.appending(path: "Other"))
+        let other = Library(folder: folder.appending(path: "Other"), preferences: preferences())
         other.importItems([source], into: other.createSet(named: "Theirs").id)
-        let library = Library(folder: folder.appending(path: "Mine"))
+        let library = Library(folder: folder.appending(path: "Mine"), preferences: preferences())
         library.createSet(named: "Mine")
 
         try library.switchLibrary(to: other.folder)
@@ -164,13 +174,14 @@ final class ExportTests: XCTestCase {
 
         XCTAssertThrowsError(try library.switchLibrary(to: folder))
         XCTAssertEqual(library.setPaths.map(\.path), ["Theirs"], "a refused switch changes nothing")
-        XCTAssertEqual(Library(folder: folder.appending(path: "Mine")).setPaths.map(\.path),
-                       ["Mine"], "the library switched away from was saved")
+        let mine = Library(folder: folder.appending(path: "Mine"), preferences: preferences())
+        XCTAssertEqual(mine.setPaths.map(\.path), ["Mine"],
+                       "the library switched away from was saved")
     }
 
     @MainActor
     func testBackUpWritesDatedZipsOutsideTheLibrary() async throws {
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         library.createSet(named: "Set")
         let backups = folder.appending(path: "Backups")
 
@@ -185,7 +196,11 @@ final class ExportTests: XCTestCase {
         do {
             try await library.backUp(into: inside)
             XCTFail("a backup was written inside the library it backs up")
-        } catch {}
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription, Library.Problem.backupInsideLibrary.errorDescription
+            )
+        }
         XCTAssertThrowsError(try library.changeBackupFolder(to: inside))
     }
 
@@ -263,7 +278,7 @@ final class ExportTests: XCTestCase {
         try FileManager.default.copyItem(at: source, to: incoming.appending(path: "up.svg"))
         try Data("not an icon".utf8).write(to: incoming.appending(path: "README.md"))
 
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let report = library.importItems([incoming], into: nil)
 
         XCTAssertEqual(report.imported, 1)
@@ -271,7 +286,9 @@ final class ExportTests: XCTestCase {
         XCTAssertEqual(library.sets.map(\.name), ["Arrows"])
         XCTAssertEqual(library.icons.map(\.name), ["up"])
 
-        let reopened = Library(folder: folder.appending(path: "Library"))
+        let reopened = Library(
+            folder: folder.appending(path: "Library"), preferences: preferences()
+        )
         XCTAssertEqual(reopened.icons.map(\.name), ["up"], "the library survives a relaunch")
     }
 
@@ -320,7 +337,7 @@ final class ExportTests: XCTestCase {
             at: lucide.appending(path: "Empty"), withIntermediateDirectories: true
         )
 
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         library.importItems([lucide], into: nil)
 
         XCTAssertEqual(
@@ -337,7 +354,7 @@ final class ExportTests: XCTestCase {
     @MainActor
     func testDeletingASetDeletesWhatIsInsideIt() throws {
         let (_, source) = try makeSVGIcon()
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let outer = library.createSet(named: "Outer")
         let inner = library.createSet(named: "Inner", inside: outer.id)
         let other = library.createSet(named: "Other")
@@ -355,7 +372,7 @@ final class ExportTests: XCTestCase {
 
     @MainActor
     func testASetCannotMoveIntoItself() {
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let outer = library.createSet(named: "Outer")
         let inner = library.createSet(named: "Inner", inside: outer.id)
 
@@ -377,7 +394,7 @@ final class ExportTests: XCTestCase {
             + #"name":"MacOS"}]}"#
         try Data(saved.utf8).write(to: libraryFolder.appending(path: "library.json"))
 
-        let library = Library(folder: libraryFolder)
+        let library = Library(folder: libraryFolder, preferences: preferences())
         XCTAssertNil(library.notice)
         XCTAssertEqual(library.setPaths.map(\.path), ["MacOS"])
     }
@@ -466,7 +483,7 @@ final class ExportTests: XCTestCase {
     func testLicencesStartWithIconJarsAndLeaveIconsWhenRemoved() throws {
         let (_, source) = try makeSVGIcon()
         let folder = self.folder.appending(path: "Library")
-        let library = Library(folder: folder)
+        let library = Library(folder: folder, preferences: preferences())
         XCTAssertEqual(library.licenses.first?.name, "MIT")
         XCTAssertEqual(library.licenses.count, 9)
         library.importItems([source], into: library.createSet(named: "Set").id)
@@ -476,7 +493,7 @@ final class ExportTests: XCTestCase {
         library.setInfo(icon.id, "  A house.  ")
         library.setTags(icon.id, ["home", " building ", ""])
 
-        let reopened = Library(folder: folder)
+        let reopened = Library(folder: folder, preferences: preferences())
         let saved = try XCTUnwrap(reopened.icons.first)
         XCTAssertEqual(reopened.license(of: saved)?.name, "MIT")
         XCTAssertEqual(saved.info, "A house.")
@@ -484,7 +501,7 @@ final class ExportTests: XCTestCase {
 
         reopened.removeLicense(mit.id)
         XCTAssertNil(reopened.icons.first?.licenseID)
-        XCTAssertEqual(Library(folder: folder).licenses.count, 8)
+        XCTAssertEqual(Library(folder: folder, preferences: preferences()).licenses.count, 8)
     }
 
     @MainActor
@@ -531,7 +548,7 @@ final class ExportTests: XCTestCase {
 
     @MainActor
     func testSavingAPresetKeepsTheCurrentSettings() throws {
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         library.export = ExportOptions()
         library.export.format = .jpg
         library.export.sizes = [48, 96]
@@ -1118,7 +1135,7 @@ final class ExportTests: XCTestCase {
     func testSavingFollowsALibraryFolderMovedInFinder() throws {
         let (_, source) = try makeSVGIcon()
         let original = folder.appending(path: "Library")
-        let library = Library(folder: original)
+        let library = Library(folder: original, preferences: preferences())
         library.importItems([source], into: library.createSet(named: "Set").id)
 
         // What Finder's rename or move amounts to on disk, mid-session.
@@ -1133,7 +1150,8 @@ final class ExportTests: XCTestCase {
             FileManager.default.fileExists(atPath: original.path(percentEncoded: false)),
             "nothing recreates the old path: that would split the library in two"
         )
-        XCTAssertEqual(Library(folder: moved).setPaths.map(\.path), ["After", "Set"])
+        let reopened = Library(folder: moved, preferences: preferences())
+        XCTAssertEqual(reopened.setPaths.map(\.path), ["After", "Set"])
         XCTAssertNotNil(library.image(for: try XCTUnwrap(library.icons.first)))
     }
 
@@ -1182,7 +1200,7 @@ final class ExportTests: XCTestCase {
     @MainActor
     func testUndoKeepsARecentlyUsedStampMadeAfterTheStep() throws {
         let (_, source) = try makeSVGIcon()
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let undoManager = UndoManager()
         // One group per action, opened by hand: the implicit per-event grouping needs a run
         // loop, and a test turn has none.
@@ -1241,7 +1259,7 @@ final class ExportTests: XCTestCase {
     @MainActor
     func testBackupUnzipsToTheSameLibrary() async throws {
         let (_, source) = try makeSVGIcon()
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let outer = library.createSet(named: "Outer")
         let inner = library.createSet(named: "Inner", inside: outer.id)
         library.importItems([source], into: inner.id)
@@ -1259,10 +1277,12 @@ final class ExportTests: XCTestCase {
         unzip.waitUntilExit()
         XCTAssertEqual(unzip.terminationStatus, 0)
 
-        let restored = Library(folder: unpacked.appending(path: "Library"))
+        let restored = Library(
+            folder: unpacked.appending(path: "Library"), preferences: preferences()
+        )
         // Against a fresh load, not `library`: the index stores dates to the second, so the
         // in-memory `added` carries fractions that never reach disk.
-        let saved = Library(folder: folder.appending(path: "Library"))
+        let saved = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         XCTAssertEqual(restored.setPaths.map(\.path), ["Outer", "Outer › Inner"])
         XCTAssertEqual(restored.icons, saved.icons, "names, sets, tags and stars all survive")
         XCTAssertEqual(restored.icons.map(\.starred), [true])
@@ -1273,7 +1293,7 @@ final class ExportTests: XCTestCase {
     @MainActor
     func testAFailedBackupLeavesNoPartOfAZip() async throws {
         let (_, source) = try makeSVGIcon()
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         library.importItems([source], into: nil)
         // The snapshot copy clones, which writes nothing, but ditto has to write the zip: with
         // files capped well below the library's size it stops part way with a zip begun, which
@@ -1299,7 +1319,7 @@ final class ExportTests: XCTestCase {
     func testAnUnreadableLibraryIsNeverSavedOver() throws {
         let (_, source) = try makeSVGIcon()
         let libraryFolder = folder.appending(path: "Library")
-        Library(folder: libraryFolder).importItems([source], into: nil)
+        Library(folder: libraryFolder, preferences: preferences()).importItems([source], into: nil)
         let index = libraryFolder.appending(path: "library.json")
         let before = try Data(contentsOf: index)
         let path = index.path(percentEncoded: false)
@@ -1307,7 +1327,7 @@ final class ExportTests: XCTestCase {
         let readable: [FileAttributeKey: Any] = [.posixPermissions: 0o644]
         defer { try? FileManager.default.setAttributes(readable, ofItemAtPath: path) }
 
-        let library = Library(folder: libraryFolder)
+        let library = Library(folder: libraryFolder, preferences: preferences())
         XCTAssertNotNil(library.notice, "says it couldn't read the library")
         library.createSet(named: "New")
 
@@ -1328,7 +1348,7 @@ final class ExportTests: XCTestCase {
             + #"{"id":"\#(b)","name":"B","parentID":"\#(a)"}]}"#
         try Data(saved.utf8).write(to: libraryFolder.appending(path: "library.json"))
 
-        let library = Library(folder: libraryFolder)
+        let library = Library(folder: libraryFolder, preferences: preferences())
         XCTAssertEqual(library.setPaths.map(\.path), ["A", "A › B"],
                        "cut where the loop closes, so both sets show")
         XCTAssertEqual(library.subtree(of: try XCTUnwrap(UUID(uuidString: a))).count, 2)
@@ -1361,7 +1381,7 @@ final class ExportTests: XCTestCase {
 
     @MainActor
     func testAlertsWaitTheirTurn() async throws {
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         library.notice = Notice(title: "First", message: "")
         library.notice = Notice(title: "Second", message: "")
         XCTAssertEqual(library.notice?.title, "First", "a second alert doesn't replace the first")
@@ -1421,7 +1441,7 @@ final class ExportTests: XCTestCase {
             0, NULL, NULL, 3, 0);
         """)
 
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         let report = try library.importIconJar(jar, into: nil)
 
         XCTAssertEqual(report.imported, 3)
@@ -1451,18 +1471,17 @@ final class ExportTests: XCTestCase {
         XCTAssertEqual(library.icons.count, 3)
     }
 
-    func testBothIconJarExtensionsAreRecognised() {
+    func testBothIconJarExtensionsAreRecognised() throws {
         XCTAssertTrue(IconJarLibrary.isLibrary(URL(filePath: "/x/IconJar-backup.ijlibrary")))
         XCTAssertTrue(IconJarLibrary.isLibrary(URL(filePath: "/x/Old.IconJarLibrary")))
         XCTAssertFalse(IconJarLibrary.isLibrary(URL(filePath: "/x/icons")))
-        if let type = IconJarLibrary.libraryType {
-            XCTAssertTrue(type.conforms(to: .package), "the open panel shows a library as one file")
-        }
+        guard let type = IconJarLibrary.libraryType else { throw XCTSkip("IconJar not installed") }
+        XCTAssertTrue(type.conforms(to: .package), "the open panel shows a library as one file")
     }
 
     @MainActor
     func testFolderWithoutJarsDBIsNotAnIconJarLibrary() {
-        let library = Library(folder: folder.appending(path: "Library"))
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
         XCTAssertThrowsError(try library.importIconJar(folder, into: nil))
     }
 
@@ -1867,6 +1886,7 @@ final class ExportTests: XCTestCase {
         XCTAssertEqual(library.notice?.title, "Your backup folder couldn't be found")
         await library.backUpIfDue()
         XCTAssertNil(library.lastBackup, "the schedule is paused, not writing into the Trash")
+        XCTAssertTrue(exists(landed))
         XCTAssertTrue(names(in: landed).isEmpty)
         do {
             try await library.backUp(into: landed)
@@ -1908,13 +1928,13 @@ final class ExportTests: XCTestCase {
 
     @MainActor
     func testTheOldSharedLastBackupIsNotGivenToABrandNewLibrary() {
-        UserDefaults.standard.set(Date.now.addingTimeInterval(-3600), forKey: Library.lastBackupKey)
+        Library.defaults.set(Date.now.addingTimeInterval(-3600), forKey: Library.lastBackupKey)
 
         let library = Library(folder: folder.appending(path: "Fresh"), preferences: preferences())
 
         XCTAssertNil(library.lastBackup, "a library with no index has no backups behind it")
         XCTAssertNotNil(
-            UserDefaults.standard.object(forKey: Library.lastBackupKey),
+            Library.defaults.object(forKey: Library.lastBackupKey),
             "and the date stays for the library it belongs to"
         )
     }
@@ -1945,7 +1965,9 @@ final class ExportTests: XCTestCase {
         library.importItems([try writeSVG("x", #"<path d="M1 1h4"/>"#)], into: nil)
 
         let scan = Task { await library.checkLibrary() }
-        while !library.isChecking { await Task.yield() }
+        // Yielding rather than sleeping: a scan this small is done within a few milliseconds.
+        for _ in 0..<10_000 where !library.isChecking { await Task.yield() }
+        XCTAssertTrue(library.isChecking, "the scan never began")
         try library.switchLibrary(to: other)
         await scan.value
 
@@ -2154,16 +2176,16 @@ final class ExportTests: XCTestCase {
         Library(folder: libraryA, preferences: preferences()).createSet(named: "A")
         Library(folder: libraryB, preferences: preferences()).createSet(named: "B")
         let old = Date.now.addingTimeInterval(-3600)
-        UserDefaults.standard.set(old, forKey: Library.lastBackupKey)
+        Library.defaults.set(old, forKey: Library.lastBackupKey)
 
         let library = Library(folder: libraryA, preferences: preferences())
         let inherited = try XCTUnwrap(library.lastBackup)
         XCTAssertEqual(inherited.timeIntervalSince1970, old.timeIntervalSince1970, accuracy: 1)
-        XCTAssertNotNil(UserDefaults.standard.object(forKey: Library.lastBackupKey),
+        XCTAssertNotNil(Library.defaults.object(forKey: Library.lastBackupKey),
                         "kept until it is in the index")
 
         library.createSet(named: "Saves")
-        XCTAssertNil(UserDefaults.standard.object(forKey: Library.lastBackupKey),
+        XCTAssertNil(Library.defaults.object(forKey: Library.lastBackupKey),
                      "once saved into the index it is gone from UserDefaults")
         try library.switchLibrary(to: libraryB)
         XCTAssertNil(library.lastBackup, "it never leaks into another library")
@@ -2247,8 +2269,12 @@ final class ExportTests: XCTestCase {
                 to: folder.appending(path: "x.iconerybackup"), snapshotsIn: snapshots
             )
             XCTFail("the copy can't succeed without the icon")
-        } catch {}
+        } catch {
+            XCTAssertFalse(error is Library.Problem, "the copy is what failed: \(error)")
+            XCTAssertEqual((error as NSError).domain, NSCocoaErrorDomain)
+        }
 
+        XCTAssertTrue(exists(snapshots))
         XCTAssertEqual(names(in: snapshots), [], "the half-made snapshot was cleaned up")
     }
 
@@ -2694,14 +2720,14 @@ final class ExportTests: XCTestCase {
          {"id":"later","name":"Later","outputs":[{"format":"webp","sizes":[64],"prefix":"",
           "suffix":"","includeSize":false}]}]
         """
-        UserDefaults.standard.set(Data(json.utf8), forKey: "exportPresets")
+        Library.defaults.set(Data(json.utf8), forKey: "exportPresets")
         let library = Library(
             folder: folder.appending(path: "Library"), preferences: preferences()
         )
         XCTAssertEqual(library.presets.map(\.id), ["mine"])
 
         library.savePreset(named: "New")
-        let stored = try XCTUnwrap(UserDefaults.standard.data(forKey: "exportPresets"))
+        let stored = try XCTUnwrap(Library.defaults.data(forKey: "exportPresets"))
         let items = try XCTUnwrap(try JSONSerialization.jsonObject(with: stored) as? [[String: Any]])
         XCTAssertEqual(items.compactMap { $0["name"] as? String }, ["Mine", "New", "Later"])
         let later = try XCTUnwrap(items.last)
@@ -2710,7 +2736,7 @@ final class ExportTests: XCTestCase {
 
         library.deletePreset("mine")
         XCTAssertEqual(ExportPreset.loadSaved().map(\.name), ["New"])
-        let after = try XCTUnwrap(UserDefaults.standard.data(forKey: "exportPresets"))
+        let after = try XCTUnwrap(Library.defaults.data(forKey: "exportPresets"))
         let names = try XCTUnwrap(try JSONSerialization.jsonObject(with: after) as? [[String: Any]])
             .compactMap { $0["name"] as? String }
         XCTAssertEqual(names, ["New", "Later"])
@@ -2903,12 +2929,12 @@ final class ExportTests: XCTestCase {
     func testAStandInLibraryDoesNotTakeTheOldSharedLastBackup() throws {
         let gone = folder.appending(path: "Gone")
         try FileManager.default.createDirectory(at: gone, withIntermediateDirectories: true)
-        UserDefaults.standard.set(try gone.bookmarkData(), forKey: Library.libraryKey)
+        Library.defaults.set(try gone.bookmarkData(), forKey: Library.libraryKey)
         try FileManager.default.removeItem(at: gone)
         let standIn = folder.appending(path: "StandIn")
         Library(folder: standIn, preferences: preferences()).createSet(named: "Default")
         let old = Date.now.addingTimeInterval(-3600)
-        UserDefaults.standard.set(old, forKey: Library.lastBackupKey)
+        Library.defaults.set(old, forKey: Library.lastBackupKey)
 
         let library = Library(defaultFolder: standIn, preferences: preferences())
 
@@ -2916,7 +2942,7 @@ final class ExportTests: XCTestCase {
         XCTAssertEqual(library.folder.resolvingSymlinksInPath(), standIn.resolvingSymlinksInPath())
         XCTAssertNil(library.lastBackup, "the stand-in isn't the library those backups were of")
         XCTAssertNotNil(
-            UserDefaults.standard.object(forKey: Library.lastBackupKey),
+            Library.defaults.object(forKey: Library.lastBackupKey),
             "left for the real library to take"
         )
     }
