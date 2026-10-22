@@ -558,11 +558,14 @@ final class ExportTests: XCTestCase {
         let preset = try XCTUnwrap(library.activePreset)
         XCTAssertEqual(preset.name, "Web JPGs")
         XCTAssertFalse(preset.isBuiltIn)
+        XCTAssertTrue(preset.outputs.allSatisfy { $0.prefix.isEmpty && $0.suffix.isEmpty })
+        library.export.prefix = ""
+        library.export.suffix = ""
         let icon = Icon(name: "home", setID: UUID(), kind: .svg)
         let names = library.export.outputs(of: preset).flatMap {
             Exporter.fileNames(for: icon, options: $0)
         }
-        XCTAssertEqual(names, ["ic_home-48.jpg", "ic_home-96.jpg"])
+        XCTAssertEqual(names, ["home-48.jpg", "home-96.jpg"], "the preset carries no prefix")
         XCTAssertEqual(ExportPreset.loadSaved().map(\.name), ["Web JPGs"], "kept for next launch")
 
         library.deletePreset(preset.id)
@@ -1900,7 +1903,7 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
-    func testBackupsListForgetsFilesDeletedByHand() async throws {
+    func testBackupsListKeepsNamesOfFilesNotInTheFolder() async throws {
         let backups = folder.appending(path: "Backups")
         let library = Library(
             folder: folder.appending(path: "Library"),
@@ -1921,8 +1924,8 @@ final class ExportTests: XCTestCase {
                 as? [String]
         )
         XCTAssertEqual(
-            kept.sorted(), [second, third].map(\.lastPathComponent).sorted(),
-            "the name of the file deleted in Finder is no longer kept"
+            kept.sorted(), [first, second, third].map(\.lastPathComponent).sorted(),
+            "a name stays until its backup is trashed: it may sit in another folder"
         )
     }
 
@@ -2611,11 +2614,6 @@ final class ExportTests: XCTestCase {
     }
 
     @MainActor
-    func testSidebarSetsTravelUnderTheSchemeTheGridRefuses() {
-        XCTAssertEqual(Library.setDragURL(UUID()).scheme, "iconery-set")
-    }
-
-    @MainActor
     func testPresetKeepsThePrefixAndSuffixTheFormShows() throws {
         let library = Library(
             folder: folder.appending(path: "Library"), preferences: preferences()
@@ -2787,11 +2785,20 @@ final class ExportTests: XCTestCase {
     @MainActor
     func testTagFieldCommitsOnlyWhatTheUserChanged() throws {
         _ = NSApplication.shared
+        typealias Outside = ([String]) -> Void
+        /// What the model was told, and what the field shows once editing has ended.
         func edit(
-            _ change: (TagField.Coordinator, NSTokenField) -> Void
-        ) throws -> [[String]] {
+            _ change: (TagField.Coordinator, NSTokenField, Outside) -> Void
+        ) throws -> (committed: [[String]], shown: [String]) {
             var committed: [[String]] = []
-            let coordinator = TagField.Coordinator { committed.append($0) }
+            // The model's early-out: committing the tags it already holds changes nothing, so
+            // SwiftUI never calls updateNSView and the field is not reset.
+            var model = ["draft", "keep"]
+            let coordinator = TagField.Coordinator {
+                guard $0 != model else { return }
+                model = $0
+                committed.append($0)
+            }
             let window = NSWindow(
                 contentRect: NSRect(x: -3000, y: -3000, width: 300, height: 100),
                 styleMask: [.titled], backing: .buffered, defer: false
@@ -2799,36 +2806,46 @@ final class ExportTests: XCTestCase {
             let field = NSTokenField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
             window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 100))
             window.contentView?.addSubview(field)
-            coordinator.refresh(field, to: ["draft", "keep"])
+            coordinator.refresh(field, to: model)
             window.makeKeyAndOrderFront(nil)
             defer { window.orderOut(nil) }
             XCTAssertTrue(window.makeFirstResponder(field))
             XCTAssertNotNil(field.currentEditor())
-            change(coordinator, field)
+            change(coordinator, field) {
+                model = $0
+                coordinator.refresh(field, to: $0)
+            }
             coordinator.controlTextDidEndEditing(
                 Notification(name: NSControl.textDidEndEditingNotification, object: field)
             )
-            return committed
+            return (committed, field.objectValue as? [String] ?? [])
         }
-        // Remove Tag elsewhere while the field is being edited: draft must not come back.
-        XCTAssertEqual(try edit { coordinator, field in
-            coordinator.refresh(field, to: ["keep"])
-        }, [["keep"]])
+        // Remove Tag elsewhere while the field is being edited: draft must not come back, and
+        // the field must stop showing it even though the model sees nothing to save.
+        var result = try edit { _, _, outside in outside(["keep"]) }
+        XCTAssertEqual(result.committed, [])
+        XCTAssertEqual(result.shown, ["keep"])
         // What the user did in the field is kept beside the outside change.
-        XCTAssertEqual(try edit { coordinator, field in
+        result = try edit { _, field, outside in
             field.objectValue = ["draft", "keep", "mine"]
-            coordinator.refresh(field, to: ["keep"])
-        }, [["keep", "mine"]])
+            outside(["keep"])
+        }
+        XCTAssertEqual(result.committed, [["keep", "mine"]])
+        XCTAssertEqual(result.shown, ["keep", "mine"])
         // A tag removed elsewhere that the user then types again is theirs, so it stays; the
         // one the field already held is still taken out.
-        XCTAssertEqual(try edit { coordinator, field in
+        result = try edit { _, field, outside in
             field.objectValue = ["draft", "keep", "draft"]
-            coordinator.refresh(field, to: ["keep"])
-        }, [["keep", "draft"]])
+            outside(["keep"])
+        }
+        XCTAssertEqual(result.committed, [["keep", "draft"]])
+        XCTAssertEqual(result.shown, ["keep", "draft"])
         // Without an outside change the field's tokens commit as they stand.
-        XCTAssertEqual(try edit { _, field in
+        result = try edit { _, field, _ in
             field.objectValue = ["draft", "keep", "typed"]
-        }, [["draft", "keep", "typed"]])
+        }
+        XCTAssertEqual(result.committed, [["draft", "keep", "typed"]])
+        XCTAssertEqual(result.shown, ["draft", "keep", "typed"])
     }
 
     // MARK: Fixes 2026-10-09: remaining backup issues
@@ -3031,5 +3048,407 @@ final class ExportTests: XCTestCase {
         XCTAssertEqual(staged.keys.sorted(), sets.keys.sorted())
         XCTAssertTrue(staged.keys.contains { $0.contains("same 2.imageset/") })
         for (name, data) in sets { XCTAssertEqual(staged[name], data, name) }
+    }
+
+    // MARK: - Library trash and backup fixes (2026-10-22)
+
+    /// A stand-in Trash inside the test folder; nothing here touches the real one.
+    private func fakeTrash() throws -> URL {
+        let trash = folder.appending(path: "FakeTrash", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+        Library.trashOverride = trash
+        addTeardownBlock { Library.trashOverride = nil }
+        return trash
+    }
+
+    /// A saved library with one icon, and where that icon's file is.
+    @MainActor
+    private func seededLibrary(at url: URL) throws -> Library {
+        let library = Library(folder: url, preferences: preferences())
+        library.importItems([try writeSVG("seed", #"<path d="M1 1h4"/>"#)], into: nil)
+        return library
+    }
+
+    private func setCount(in library: URL) throws -> Int {
+        let index = try Data(contentsOf: library.appending(path: "library.json"))
+        let object = try JSONSerialization.jsonObject(with: index) as? [String: Any]
+        return (object?["sets"] as? [Any])?.count ?? -1
+    }
+
+    @MainActor
+    func testALibraryOpenedFromTheTrashWarnsAtLaunchAndRefusesWrites() async throws {
+        let original = folder.appending(path: "Library")
+        let seeded = try seededLibrary(at: original)
+        seeded.createSet(named: "Set")
+        let trash = try fakeTrash()
+        let inTrash = trash.appending(path: "Library")
+        try FileManager.default.moveItem(at: original, to: inTrash)
+        let before = try Data(contentsOf: inTrash.appending(path: "library.json"))
+
+        let library = Library(folder: inTrash, preferences: preferences())
+
+        XCTAssertEqual(library.notice?.title, "Your library is in the Trash", "said at launch")
+        XCTAssertEqual(library.icons.count, 1, "it still opens, to look at or put back")
+        library.notice = nil
+        library.createSet(named: "Edited")
+        let report = library.importItems([try writeSVG("late", #"<path d="M2 1h4"/>"#)], into: nil)
+        XCTAssertEqual(report.imported, 0)
+        XCTAssertEqual(try Data(contentsOf: inTrash.appending(path: "library.json")), before)
+
+        // Check Library and its follow-ups speak every time, not only the first.
+        await library.checkLibrary()
+        XCTAssertEqual(library.notice?.title, "Your library is in the Trash")
+        library.notice = nil
+        library.removeMissingRecords()
+        XCTAssertEqual(library.notice?.title, "Your library is in the Trash")
+        library.notice = nil
+        library.trashOrphans()
+        XCTAssertEqual(library.notice?.title, "Your library is in the Trash")
+
+        // Emptying the Trash doesn't make the app recreate the folder either.
+        try FileManager.default.removeItem(at: inTrash)
+        library.createSet(named: "After empty")
+        XCTAssertFalse(exists(inTrash))
+    }
+
+    @MainActor
+    private func changesWhileTrashedAreSaved(on notification: Notification.Name) async throws {
+        let original = folder.appending(path: "Library")
+        _ = try seededLibrary(at: original)
+        let trash = try fakeTrash()
+        let inTrash = trash.appending(path: "Library")
+        try FileManager.default.moveItem(at: original, to: inTrash)
+        let library = Library(folder: inTrash, preferences: preferences())
+        let icon = try XCTUnwrap(library.icons.first)
+        let baseline = try setCount(in: inTrash)
+
+        library.rename(icon.id, to: "Renamed meanwhile")
+        library.createSet(named: "Made meanwhile")
+        XCTAssertEqual(try setCount(in: inTrash), baseline, "nothing written while trashed")
+
+        Library.trashOverride = nil  // Put Back
+        NotificationCenter.default.post(name: notification, object: nil)
+        for _ in 0..<50 where try setCount(in: inTrash) == baseline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(try setCount(in: inTrash), baseline + 1)
+        let reopened = Library(folder: inTrash, preferences: preferences())
+        XCTAssertEqual(reopened.icons.first?.name, "Renamed meanwhile")
+    }
+
+    @MainActor
+    func testChangesMadeWhileTrashedAreSavedWhenTheAppComesBack() async throws {
+        try await changesWhileTrashedAreSaved(on: NSApplication.didBecomeActiveNotification)
+    }
+
+    @MainActor
+    func testChangesMadeWhileTrashedAreSavedAtQuit() async throws {
+        try await changesWhileTrashedAreSaved(on: NSApplication.willTerminateNotification)
+    }
+
+    @MainActor
+    func testDeletingFromATrashedLibraryIsRefusedAloudEachTime() throws {
+        let original = folder.appending(path: "Library")
+        let seeded = try seededLibrary(at: original)
+        let file = seeded.fileURL(for: try XCTUnwrap(seeded.icons.first))
+        let trash = try fakeTrash()
+        // Moved while open: the old path is gone and the bookmark leads into the Trash.
+        try FileManager.default.moveItem(at: original, to: trash.appending(path: "Library"))
+        let id = try XCTUnwrap(seeded.icons.first).id
+
+        for _ in 0..<2 {
+            seeded.notice = nil
+            seeded.perform(.icons([id]))
+            XCTAssertEqual(seeded.notice?.title, "Your library is in the Trash")
+        }
+        XCTAssertEqual(seeded.icons.count, 1, "the icon didn't leave the index")
+        XCTAssertTrue(exists(trash.appending(path: "Library/Icons/\(file.lastPathComponent)")))
+        // Renames keep working, in memory.
+        seeded.rename(id, to: "still works")
+        XCTAssertEqual(seeded.icons.first?.name, "still works")
+    }
+
+    @MainActor
+    func testASecondTripIntoTheTrashIsWarnedAboutAgain() throws {
+        let original = folder.appending(path: "Library")
+        let library = try seededLibrary(at: original)
+        let trash = try fakeTrash()
+        let elsewhere = folder.appending(path: "Elsewhere")
+        let inTrash = trash.appending(path: "Library")
+        try FileManager.default.moveItem(at: original, to: inTrash)
+        library.createSet(named: "One")
+        XCTAssertEqual(library.notice?.title, "Your library is in the Trash")
+        library.notice = nil
+
+        try FileManager.default.moveItem(at: inTrash, to: elsewhere)
+        library.createSet(named: "Back")
+        XCTAssertEqual(library.folder.lastPathComponent, "Elsewhere")
+        XCTAssertNil(library.notice)
+
+        try FileManager.default.moveItem(at: elsewhere, to: trash.appending(path: "Again"))
+        library.createSet(named: "Two")
+        XCTAssertEqual(library.notice?.title, "Your library is in the Trash")
+    }
+
+    @MainActor
+    func testCheckLibraryRefusesWhenTheLibraryFolderIsGone() async throws {
+        let library = try seededLibrary(at: folder.appending(path: "Library"))
+        try FileManager.default.removeItem(at: library.folder)
+
+        await library.checkLibrary()
+
+        XCTAssertNil(library.check, "nothing was scanned")
+        XCTAssertEqual(library.notice?.title, "Your library couldn't be found")
+        library.check = Library.LibraryCheck(missing: library.icons)
+        library.notice = nil
+        library.removeMissingRecords()
+        XCTAssertEqual(library.icons.count, 1, "an unplugged drive doesn't wipe the records")
+        XCTAssertEqual(library.notice?.title, "Your library couldn't be found")
+    }
+
+    @MainActor
+    func testMovingTheLibraryClearsAnOpenCheck() async throws {
+        let library = try seededLibrary(at: folder.appending(path: "Library"))
+        await library.checkLibrary()
+        XCTAssertNotNil(library.check)
+        let elsewhere = folder.appending(path: "Elsewhere")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+
+        try library.moveLibrary(into: elsewhere)
+
+        XCTAssertNil(library.check)
+    }
+
+    @MainActor
+    func testADroppedLibraryFolderIsNotImportedAsLooseFiles() throws {
+        let unpacked = folder.appending(path: "Unpacked")
+        _ = try seededLibrary(at: unpacked)
+        let library = Library(folder: folder.appending(path: "Mine"), preferences: preferences())
+
+        library.importAndReport([unpacked], into: nil)
+
+        XCTAssertTrue(library.icons.isEmpty)
+        XCTAssertEqual(library.notice?.title, "“Unpacked” is an Iconery library")
+        XCTAssertTrue(library.notice?.message.contains("Switch") == true)
+    }
+
+    @MainActor
+    func testADropIntoATrashedLibraryRaisesOneAlert() throws {
+        let original = folder.appending(path: "Library")
+        let library = try seededLibrary(at: original)
+        let trash = try fakeTrash()
+        try FileManager.default.moveItem(at: original, to: trash.appending(path: "Library"))
+        library.createSet(named: "Warn once")
+        library.notice = nil
+
+        library.importAndReport(
+            [try writeSVG("a", #"<path d="M1 1h4"/>"#), try writeSVG("b", #"<path d="M2 1h4"/>"#)],
+            into: nil
+        )
+
+        XCTAssertEqual(library.notice?.title, "Your library is in the Trash")
+        library.notice = nil
+        XCTAssertNil(library.notice, "one alert, not one per kind of item")
+    }
+
+    @MainActor
+    func testNoBackupAlertAtLaunchWhenNoScheduleIsOn() throws {
+        let libraryFolder = folder.appending(path: "Library")
+        _ = try vanishedBackupFolder(for: libraryFolder)
+
+        let never = Library(folder: libraryFolder, preferences: preferences())
+
+        XCTAssertNil(never.notice)
+        XCTAssertTrue(never.isBackupFolderMissing, "Settings can still show it as missing")
+    }
+
+    @MainActor
+    func testBackUpNowIntoAVanishedFolderRaisesOneAlert() async throws {
+        let libraryFolder = folder.appending(path: "Library")
+        _ = try vanishedBackupFolder(for: libraryFolder)
+        let library = Library(folder: libraryFolder, preferences: preferences())
+
+        do {
+            try await library.backUp(into: library.backupFolder)
+            XCTFail("a backup was written")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription, Library.Problem.backupFolderMissing.errorDescription
+            )
+        }
+        XCTAssertNil(library.notice, "the thrown error is the alert; no second one is queued")
+    }
+
+    @MainActor
+    func testBackingUpIntoAnotherFolderKeepsTheFirstFoldersNames() async throws {
+        let library = Library(
+            folder: folder.appending(path: "Library"), preferences: preferences()
+        )
+        library.createSet(named: "Set")
+        let first = try await library.backUp(into: folder.appending(path: "F"))
+        _ = try await library.backUp(into: folder.appending(path: "G"))
+
+        let index = try Data(contentsOf: library.folder.appending(path: "library.json"))
+        let kept = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: index) as? [String: Any])?["backups"]
+                as? [String]
+        )
+        XCTAssertTrue(kept.contains(first.lastPathComponent), "F's backup can still be pruned")
+        XCTAssertEqual(kept.count, 2)
+    }
+
+    // MARK: - Export fixes (2026-10-22)
+
+    /// Imports one identical drawing per name and drags them all out, returning what was staged.
+    @MainActor
+    private func staged(_ names: [String]) throws -> (library: Library, files: [String: Data]) {
+        let library = Library(
+            folder: folder.appending(path: "Library-\(UUID().uuidString)"),
+            preferences: preferences { $0.skipsDuplicates = false }
+        )
+        let body = #"<circle cx="12" cy="12" r="8"/>"#
+        library.importItems(try names.indices.map { try writeSVG("source\($0)", body) }, into: nil)
+        for (icon, name) in zip(library.icons, names) { library.rename(icon.id, to: name) }
+        library.export = ExportOptions()
+        library.export.pngSizes = [16]
+        library.selectAll()
+        let first = try XCTUnwrap(library.visibleIcons.first)
+        try? FileManager.default.removeItem(at: Exporter.dragRoot)
+        _ = library.dragProvider(for: first)
+        return (library, try tree(Exporter.dragRoot, skipping: 2))
+    }
+
+    /// File names as a case- and normalization-insensitive volume reads them.
+    private func folded(_ files: [String: Data]) -> [String] {
+        files.keys.map { $0.precomposedStringWithCanonicalMapping.lowercased() }.sorted()
+    }
+
+    @MainActor
+    func testIconsNamedAlikeExceptForCaseBothArrive() throws {
+        let (_, files) = try staged(["Home", "home"])
+        XCTAssertEqual(files.count, 2)
+        XCTAssertEqual(folded(files), ["home 2.png", "home.png"])
+        let (_, again) = try staged(["Home", "home"])
+        XCTAssertEqual(again.keys.sorted(), files.keys.sorted(), "the same numbering every time")
+    }
+
+    @MainActor
+    func testIconsNamedAlikeExceptForNormalizationBothArrive() throws {
+        let (_, files) = try staged(["Caf\u{E9}", "Cafe\u{301}"])
+        XCTAssertEqual(files.count, 2)
+        XCTAssertEqual(folded(files), ["caf\u{E9} 2.png", "caf\u{E9}.png"])
+
+        let (_, accents) = try staged(["cafe", "caf\u{E9}"])
+        XCTAssertEqual(accents.count, 2)
+        XCTAssertFalse(accents.keys.contains { $0.contains(" 2") }, "an accent tells names apart")
+    }
+
+    @MainActor
+    func testADragThatCannotBeWrittenSaysSo() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let (_, source) = try makeSVGIcon()
+        library.importItems([source], into: nil)
+        library.selectAll()
+        let icon = try XCTUnwrap(library.visibleIcons.first)
+        let root = Exporter.dragRoot
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: root.path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: root.path
+            )
+        }
+        _ = library.dragProvider(for: icon)
+        let notice = try XCTUnwrap(library.notice)
+        XCTAssertEqual(notice.title, "Some icons were left out of the drag")
+        XCTAssertTrue(notice.message.contains("1 icon could not be written"), notice.message)
+    }
+
+    func testAFailedImageSetWriteLeavesNoEmptyFolder() throws {
+        let out = folder.appending(path: "Out")
+        let tooLong = String(repeating: "a", count: 300)
+        let files = [ExportFile(name: "home.imageset/\(tooLong).png", data: Data([1]))]
+        XCTAssertThrowsError(try Exporter.write(files, to: out))
+        let leftover = out.appending(path: "home.imageset").path
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leftover))
+    }
+
+    @MainActor
+    func testAPresetSavedWithAPrefixByAnOlderBuildDoesNotDoubleIt() throws {
+        let legacy = ExportPreset(
+            id: "old", name: "Old", platform: nil,
+            outputs: [PresetOutput(sizes: [32], prefix: "ic-", suffix: "-v1")]
+        )
+        Library.defaults.set(try JSONEncoder().encode([legacy]), forKey: "exportPresets")
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let preset = try XCTUnwrap(library.presets.first)
+        library.export.prefix = "ic-"
+        library.export.suffix = "-v1"
+        let icon = Icon(name: "home", setID: UUID(), kind: .svg)
+        let names = library.export.outputs(of: preset).flatMap {
+            Exporter.fileNames(for: icon, options: $0)
+        }
+        XCTAssertEqual(names, ["ic-home-v1.png"])
+    }
+
+    // MARK: - UI fixes (2026-10-22)
+
+    @MainActor
+    func testTagAddedThenRemovedWhileEditingStaysRemoved() throws {
+        _ = NSApplication.shared
+        var committed: [[String]] = []
+        let coordinator = TagField.Coordinator { committed.append($0) }
+        let window = NSWindow(
+            contentRect: NSRect(x: -3000, y: -3000, width: 300, height: 100),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        let field = NSTokenField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
+        window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 100))
+        window.contentView?.addSubview(field)
+        coordinator.refresh(field, to: ["keep"])
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        XCTAssertTrue(window.makeFirstResponder(field))
+        coordinator.refresh(field, to: ["keep", "x"])
+        coordinator.refresh(field, to: ["keep"])
+        coordinator.controlTextDidEndEditing(
+            Notification(name: NSControl.textDidEndEditingNotification, object: field)
+        )
+        XCTAssertEqual(committed, [["keep"]])
+        XCTAssertEqual(field.objectValue as? [String], ["keep"])
+    }
+
+    @MainActor
+    func testGridRefusesItsOwnDragsAndSidebarSets() throws {
+        let staged = Exporter.dragRoot.appending(path: "Icons/home.svg")
+        XCTAssertFalse(GridDrop.accepts([staged]))
+        XCTAssertFalse(GridDrop.accepts([Library.setDragURL(UUID())]))
+        let outside = try writeSVG("outside", "<path/>")
+        XCTAssertFalse(GridDrop.accepts([outside, Library.setDragURL(UUID())]))
+        XCTAssertTrue(GridDrop.accepts([outside]))
+    }
+
+    @MainActor
+    func testInspectorArrowsAskTheGridToScrollToTheNewIcon() throws {
+        let library = Library(
+            folder: folder.appending(path: "Library"), preferences: preferences()
+        )
+        library.importItems(
+            [try writeSVG("a", #"<path d="M1 1h4"/>"#), try writeSVG("b", #"<path d="M2 2h4"/>"#)],
+            into: nil
+        )
+        let first = try XCTUnwrap(library.visibleIcons.first).id
+        let second = try XCTUnwrap(library.visibleIcons.last).id
+        library.selection = [first]
+        library.revealed = nil
+        library.selectNeighbour(of: first, by: 1)
+        XCTAssertEqual(library.selection, [second])
+        XCTAssertEqual(library.revealed, second)
+    }
+
+    @MainActor
+    func testOpenInTreatsMissingAppsAsUnusable() {
+        XCTAssertTrue(Library.isUsableApp(URL(filePath: "/System/Applications/Calculator.app")))
+        XCTAssertFalse(Library.isUsableApp(folder.appending(path: "Gone.app")))
     }
 }

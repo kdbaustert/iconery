@@ -4,6 +4,7 @@ import SwiftUI
 struct IconeryApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var library: Library
+    @State private var keyWindow = KeyWindowWatcher()
 
     init() {
         // Before the first window draws, so a chosen Light or Dark never flashes the other.
@@ -73,16 +74,12 @@ struct IconeryApp: App {
                     } else if let window, window === AppDelegate.libraryWindow,
                               window.attachedSheet == nil {
                         library.requestDeleteIcons(library.selection)
-                    } else {
-                        // A sheet, Settings or any other window: the icons behind it aren't
-                        // what the key means there. Pass it down the responder chain as
-                        // delete:, which a sheet's list handling onDeleteCommand answers and
-                        // which otherwise goes nowhere.
-                        NSApp.sendAction(#selector(NSText.delete(_:)), to: nil, from: nil)
                     }
                 }
                 .keyboardShortcut(.delete)
-                .disabled(library.selection.isEmpty)
+                // Off while a sheet, an alert or Settings is key: the icons behind them aren't
+                // what the key means there, and nothing else would answer it.
+                .disabled(library.selection.isEmpty || !keyWindow.libraryIsKey)
             }
             CommandGroup(replacing: .importExport) {
                 Button("Import Icons…") { library.chooseAndImport() }
@@ -96,6 +93,25 @@ struct IconeryApp: App {
                     .disabled(library.isBackingUp)
                 Button("Check Library…") { Task { await library.checkLibrary() } }
                     .disabled(library.isChecking)
+            }
+        }
+    }
+}
+
+/// Whether the library window is the key window, as something the menu bar can watch.
+@MainActor
+@Observable
+final class KeyWindowWatcher {
+    private(set) var libraryIsKey = false
+
+    init() {
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.libraryIsKey = NSApp.keyWindow === AppDelegate.libraryWindow
+                }
             }
         }
     }

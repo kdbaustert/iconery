@@ -98,11 +98,15 @@ final class Library {
     /// Set when the backup folder chosen in Settings can't be found, say on a drive that isn't
     /// plugged in. Falling back to the default folder would scatter backups the user didn't
     /// ask for, so scheduled backups sit out until it resolves again or another is chosen.
-    @ObservationIgnored private var backupFolderMissing = false
+    private var backupFolderMissing = false
     /// Whether the notice about a library folder in the Trash has been shown for this stay there.
     @ObservationIgnored private var warnedOfTrash = false
+    /// Set when save() was turned away because the library is in the Trash, so what changed
+    /// meanwhile is written once it is back, or at quit.
+    @ObservationIgnored private var savePending = false
     /// Held to remove it on deinit, which isn't on the main actor.
     @ObservationIgnored private nonisolated(unsafe) var activationObserver: NSObjectProtocol?
+    @ObservationIgnored private nonisolated(unsafe) var terminateObserver: NSObjectProtocol?
 
     // What the views would otherwise work out again on every redraw: one sort of a 9,000-icon
     // library takes 28 ms (measured), and a click used to run three. Each is kept with what it was
@@ -131,6 +135,7 @@ final class Library {
     /// Where Export writes without asking; nil asks each time.
     private(set) var exportFolder: URL?
     private(set) var isBackingUp = false
+    var isBackupFolderMissing: Bool { backupFolderMissing }
     @ObservationIgnored private var duplicates: DuplicateFinder?
 
     /// Opens the library chosen in Settings, or the default one. Passing `folder` opens that
@@ -187,7 +192,7 @@ final class Library {
         if lastBackup == nil, hadIndex, !openedFallbackLibrary {
             lastBackup = Self.defaults.object(forKey: Self.lastBackupKey) as? Date
         }
-        if backupFolderMissing {
+        if backupFolderMissing, preferences.backupSchedule.interval != nil {
             notice = Self.backupFolderMissingNotice
         }
         try? FileManager.default.removeItem(at: Exporter.dragRoot)
@@ -198,12 +203,21 @@ final class Library {
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { _ = self?.followMovedFolder() }
+            MainActor.assumeIsolated { self?.resumeSaving() }
         }
+        terminateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.resumeSaving() }
+        }
+        // A library remembered while it sat in the Trash opens there; say so without waiting
+        // for an edit.
+        followMovedFolder()
     }
 
     deinit {
         if let activationObserver { NotificationCenter.default.removeObserver(activationObserver) }
+        if let terminateObserver { NotificationCenter.default.removeObserver(terminateObserver) }
     }
 
     // MARK: Persistence
@@ -324,28 +338,42 @@ final class Library {
     /// and speaks for itself every time.
     @discardableResult
     private func followMovedFolder(announce: Bool = true) -> Bool {
+        // A library remembered while in the Trash opens there, where the folder exists.
+        if Self.isInTrash(folder) { return refuseInTrash(announce: announce) }
         guard !FileManager.default.fileExists(atPath: folder.path(percentEncoded: false)) else {
             warnedOfTrash = false
             return false
         }
         guard let bookmark = folderBookmark else { return false }
         var isStale = false
+        // Without mounting: this runs on every activation and edit, and a library on a
+        // disconnected share would stall the main thread trying to reconnect it.
         guard let moved = try? URL(
-            resolvingBookmarkData: bookmark, options: .withoutUI, bookmarkDataIsStale: &isStale
+            resolvingBookmarkData: bookmark, options: [.withoutUI, .withoutMounting],
+            bookmarkDataIsStale: &isStale
         ), moved != folder,
         FileManager.default.fileExists(atPath: moved.path(percentEncoded: false))
         else { return false }
-        if Self.isInTrash(moved) {
-            if announce, !warnedOfTrash {
-                warnedOfTrash = true
-                notice = Self.inTrashNotice
-            }
-            return true
-        }
+        if Self.isInTrash(moved) { return refuseInTrash(announce: announce) }
         folder = moved
+        warnedOfTrash = false
         // Whatever a scan found points at the old place.
         check = nil
         return false
+    }
+
+    private func refuseInTrash(announce: Bool) -> Bool {
+        if announce, !warnedOfTrash {
+            warnedOfTrash = true
+            notice = Self.inTrashNotice
+        }
+        return true
+    }
+
+    /// Writes what was changed while the library sat in the Trash, once it is back.
+    private func resumeSaving() {
+        guard !followMovedFolder(), savePending else { return }
+        save()
     }
 
     private static let inTrashNotice = Notice(
@@ -360,15 +388,23 @@ final class Library {
         followMovedFolder(announce: false) ? Self.inTrashNotice : nil
     }
 
+    /// Stands in for the Trash in tests, which can't safely move a folder into the real one.
+    nonisolated(unsafe) static var trashOverride: URL?
+
     private static func isInTrash(_ url: URL) -> Bool {
-        guard let trash = try? FileManager.default.url(
+        guard let trash = trashOverride ?? (try? FileManager.default.url(
             for: .trashDirectory, in: .userDomainMask, appropriateFor: url, create: false
-        ) else { return false }
+        )) else { return false }
         return isInside(url, trash)
     }
 
     private func save() {
-        guard !indexUnreadable, !followMovedFolder() else { return }
+        guard !indexUnreadable else { return }
+        if followMovedFolder() {
+            savePending = true
+            return
+        }
+        savePending = false
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
@@ -850,7 +886,20 @@ final class Library {
         )
     }
 
+    /// Files can't be moved to the Trash from a library that is itself in it, and the icons
+    /// would leave the index with their files left behind.
+    private func refusesDeleteInTrash() -> Bool {
+        guard followMovedFolder(announce: false) else { return false }
+        notice = Notice(
+            title: "Your library is in the Trash",
+            message: "Nothing was deleted. Put it back in Finder (File ▸ Put Back) first, or "
+                + "choose Settings ▸ Switch to open another library."
+        )
+        return true
+    }
+
     func perform(_ deletion: Deletion) {
+        guard !refusesDeleteInTrash() else { return }
         let name = if case .set = deletion { "Delete Set" } else { "Delete" }
         recording(name) {
             switch deletion {
@@ -1204,6 +1253,7 @@ final class Library {
               visible.indices.contains(index + offset)
         else { return }
         settle(on: visible[index + offset].id, in: visible, extending: false)
+        revealed = visible[index + offset].id
     }
 
     /// The grid's arrow keys: from the icon last clicked, or the first icon when none is
@@ -1281,7 +1331,11 @@ final class Library {
     /// when asked: the import-time duplicate check never sees what came before it or through an
     /// IconJar import.
     func checkLibrary() async {
-        guard !isChecking, !followMovedFolder() else { return }
+        guard !isChecking else { return }
+        if let refusal = checkRefusal() {
+            notice = refusal
+            return
+        }
         isChecking = true
         let scanned = self.folder
         let snapshot = icons
@@ -1292,8 +1346,29 @@ final class Library {
         isChecking = false
         // A switch or a move in Finder while it ran leaves results about a folder that is no
         // longer this library's, and acting on them would trash or drop the wrong things.
-        guard self.folder == scanned else { return }
+        guard self.folder == scanned else {
+            notice = Notice(
+                title: "The library changed during the check",
+                message: "Nothing was changed. Choose Check Library again."
+            )
+            return
+        }
         check = result
+    }
+
+    /// Why the library can't be checked or tidied right now: it is in the Trash, or its folder
+    /// is gone (an unplugged drive), where every icon would look missing and "Remove Their
+    /// Records" would drop them all.
+    private func checkRefusal() -> Notice? {
+        if let refusal = trashRefusal() { return refusal }
+        guard !icons.isEmpty,
+              !FileManager.default.fileExists(atPath: folder.path(percentEncoded: false))
+        else { return nil }
+        return Notice(
+            title: "Your library couldn't be found",
+            message: "It may be on a drive that isn't connected. Nothing was checked, and no "
+                + "records were changed."
+        )
     }
 
     private nonisolated static func scan(icons: [Icon], folder: URL) -> LibraryCheck {
@@ -1345,7 +1420,7 @@ final class Library {
         let extras = (check?.duplicateGroups ?? []).flatMap {
             $0.filter { present.contains($0.id) }.dropFirst().map(\.id)
         }
-        guard !extras.isEmpty else { return }
+        guard !extras.isEmpty, !refusesDeleteInTrash() else { return }
         recording("Delete Duplicates") {
             removeIcons(Set(extras))
             save()
@@ -1357,7 +1432,10 @@ final class Library {
     /// that has turned up since the scan — undo, or a copy back into the folder — keeps its
     /// record.
     func removeMissingRecords() {
-        guard !followMovedFolder() else { return }
+        if let refusal = checkRefusal() {
+            notice = refusal
+            return
+        }
         let gone = (check?.missing ?? []).filter {
             !FileManager.default.fileExists(
                 atPath: fileURL(for: $0).path(percentEncoded: false)
@@ -1376,7 +1454,10 @@ final class Library {
     /// imported while the scan ran looks like an orphan to the snapshot, and trashing its
     /// file would break it with no undo.
     func trashOrphans() {
-        guard !followMovedFolder() else { return }
+        if let refusal = checkRefusal() {
+            notice = refusal
+            return
+        }
         let known = Set(icons.map(\.fileName))
         var failed: [URL] = []
         var firstError: Error?
@@ -1476,14 +1557,36 @@ final class Library {
             )
             return
         }
-        if let app {
+        let opened: @Sendable (Bool, (any Error)?) -> Void = { [weak self] success, error in
+            Task { @MainActor in
+                guard let self else { return }
+                guard success else {
+                    self.notice = Notice(
+                        title: "“\(icon.name)” could not be opened",
+                        message: error?.localizedDescription ?? "No app opened the file."
+                    )
+                    return
+                }
+                self.update([icon.id]) { $0.lastUsed = .now }
+            }
+        }
+        if let app, Self.isUsableApp(app) {
             NSWorkspace.shared.open(
                 [copy], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()
-            )
+            ) { _, error in opened(error == nil, error) }
+        } else if app == nil {
+            NSWorkspace.shared.open(
+                copy, configuration: NSWorkspace.OpenConfiguration()
+            ) { _, error in opened(error == nil, error) }
         } else {
-            NSWorkspace.shared.open(copy)
+            opened(false, nil)
         }
-        update([icon.id]) { $0.lastUsed = .now }
+    }
+
+    /// An app that is still there and not sitting in the Trash, where a deleted app lingers.
+    static func isUsableApp(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path(percentEncoded: false))
+            && !isInTrash(url)
     }
 
     // MARK: Import
@@ -1606,17 +1709,30 @@ final class Library {
                     + "folder, then open that folder with Settings ▸ Library ▸ Switch."
             )
         }
-        let urls = urls.filter { $0.pathExtension.lowercased() != "iconerybackup" }
+        let notBackups = urls.filter { $0.pathExtension.lowercased() != "iconerybackup" }
+        // A folder holding library.json and Icons is what a backup unpacks to. Imported as
+        // loose files it would lose every name, tag and set.
+        let libraries = notBackups.filter(Self.isLibraryFolder)
+        for library in libraries {
+            notice = Notice(
+                title: "“\(library.lastPathComponent)” is an Iconery library",
+                message: "To open it, choose Settings ▸ Library ▸ Switch and pick this folder. "
+                    + "Importing it here would lose its names, tags and sets."
+            )
+        }
+        let urls = notBackups.filter { !Self.isLibraryFolder($0) }
+        if !urls.isEmpty, let refusal = trashRefusal() {
+            notice = refusal
+            return false
+        }
         // An IconJar library is a folder too, but it needs reading, not walking.
         let jars = urls.filter(IconJarLibrary.isLibrary)
         for jar in jars { notice = importIconJarWithNotice(jar, into: target) }
         let files = urls.filter { !IconJarLibrary.isLibrary($0) }
-        guard !files.isEmpty else { return !jars.isEmpty || !backups.isEmpty }
-
-        if let refusal = trashRefusal() {
-            notice = refusal
-            return false
+        guard !files.isEmpty else {
+            return !jars.isEmpty || !backups.isEmpty || !libraries.isEmpty
         }
+
         let report = importItems(files, into: target)
         if report.createdSets.count == 1 { sidebar = .set(report.createdSets[0]) }
         var lines: [String] = []
@@ -1635,6 +1751,17 @@ final class Library {
             )
         }
         return report.imported > 0
+    }
+
+    private static func isLibraryFolder(_ url: URL) -> Bool {
+        let manager = FileManager.default
+        var isDirectory: ObjCBool = false
+        return manager.fileExists(
+            atPath: url.appending(path: "library.json").path(percentEncoded: false)
+        ) && manager.fileExists(
+            atPath: url.appending(path: "Icons").path(percentEncoded: false),
+            isDirectory: &isDirectory
+        ) && isDirectory.boolValue
     }
 
     private static func listed(_ names: [String]) -> String {
@@ -1987,6 +2114,7 @@ final class Library {
         }
         folder = target
         folderBookmark = try? target.bookmarkData()
+        check = nil
         Self.remember(target, as: Self.libraryKey)
     }
 
@@ -2038,10 +2166,10 @@ final class Library {
     /// renamed, moved or thrown away while the app runs, and writing to the remembered path
     /// would make a new folder there. A move or rename is followed; a folder that is gone or in
     /// the Trash pauses backups. True, with nothing to do, when none was ever chosen.
-    private func resolveBackupFolder() -> Bool {
+    private func resolveBackupFolder(announce: Bool = true) -> Bool {
         guard Self.defaults.data(forKey: Self.backupKey) != nil else { return true }
         guard let url = Self.storedBackupFolder() else {
-            if !backupFolderMissing { notice = Self.backupFolderMissingNotice }
+            if announce, !backupFolderMissing { notice = Self.backupFolderMissingNotice }
             backupFolderMissing = true
             return false
         }
@@ -2079,7 +2207,8 @@ final class Library {
         // is the default one standing in for a chosen folder that is gone, write there only if
         // the chosen one has come back.
         if destination == backupFolder {
-            guard resolveBackupFolder() else { throw Problem.backupFolderMissing }
+            // The throw is the alert here, so the notice would be a second one.
+            guard resolveBackupFolder(announce: false) else { throw Problem.backupFolderMissing }
             destination = backupFolder
         }
         guard !Self.isInside(destination, folder) else { throw Problem.backupInsideLibrary }
@@ -2103,11 +2232,9 @@ final class Library {
         let trashed = Self.pruneBackups(
             in: destination, keeping: preferences.backupsKept, owned: Set(backupNames)
         )
-        // Also the names whose file is gone from this folder, deleted by hand in Finder or
-        // written to another backup folder: pruning can never trash those, so they would pile
-        // up in library.json for good.
-        let present = Set(Self.backupFiles(in: destination).map(\.url.lastPathComponent))
-        backupNames.removeAll { trashed.contains($0) || !present.contains($0) }
+        // A name absent from this folder may be a backup in another one, which would then never
+        // be pruned; pruning skips what isn't there, so only what was trashed is dropped.
+        backupNames.removeAll { trashed.contains($0) }
         save()
         return url
     }
@@ -2333,8 +2460,7 @@ final class Library {
         }
     }
 
-    /// Saves the current format, sizes, prefix and suffix as one of the user's presets, and
-    /// switches to it.
+    /// Saves the current format and sizes as one of the user's presets, and switches to it.
     func savePreset(named name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
@@ -2521,34 +2647,34 @@ final class Library {
 
     /// Writes `items` out the way a drag or copy carries them: exported with the current
     /// settings, or the original file when exporting fails, so nothing arrives as an empty
-    /// file. Icons whose files are missing are reported and left out.
+    /// file. Icons whose files are missing, or that can't be written, are reported and left out.
     private func writtenForTransfer(
         _ items: [Icon], under root: URL, name: String, leftOutOf what: String
     ) -> (folder: URL, written: [URL]) {
         let folder = root.appending(path: UUID().uuidString).appending(path: name)
         let settings = activePreset.map { export.outputs(of: $0) } ?? [export]
-        let drawn = Exporter.transferFiles(
-            items.map { ($0, fileURL(for: $0)) }, settings: settings
+        let staged = Exporter.transfer(
+            items.map { ($0, fileURL(for: $0)) }, settings: settings, to: folder
         )
-        // Names are decided in selection order before anything is written, so a clash is renamed
-        // the same way whichever core finished first.
-        var missing: [String] = []
-        var batches: [[ExportFile]] = []
-        for (item, files) in zip(items, drawn) {
-            guard let files else {
-                missing.append(item.name)
-                continue
-            }
-            batches.append(files)
-        }
-        let written = Exporter.write(batches: batches, to: folder).flatMap { $0 }
-        if !missing.isEmpty {
-            notice = Notice(
-                title: "Some icons were left out of \(what)",
-                message: "Their files are missing from the library folder:\n" + Self.listed(missing)
+        var reasons: [String] = []
+        if !staged.missing.isEmpty {
+            reasons.append(
+                "Their files are missing from the library folder:\n" + Self.listed(staged.missing)
             )
         }
-        return (folder, written)
+        if let first = staged.failures.first {
+            reasons.append(
+                "\(plural(staged.failures.count, "icon")) could not be written. "
+                    + "“\(first.name)”: \(first.error.localizedDescription)"
+            )
+        }
+        if !reasons.isEmpty {
+            notice = Notice(
+                title: "Some icons were left out of \(what)",
+                message: reasons.joined(separator: "\n\n")
+            )
+        }
+        return (folder, staged.written)
     }
 }
 

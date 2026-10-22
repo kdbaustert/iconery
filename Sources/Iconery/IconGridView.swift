@@ -140,15 +140,14 @@ struct IconGridView: View {
             }
         }
         .dropDestination(for: URL.self) { urls, _ in
-            // A drag that began in this grid and ends over it is a slipped drag, not a move:
-            // the grid shows nested sets' icons too, and "move to the set being viewed" would
-            // quietly pull one out of its set. Moves go through the sidebar's rows.
-            guard !Library.isGridDrag(urls) else { return false }
-            // A sidebar set released over the grid has no set under it: handleDrop would nest
-            // it into the one being viewed. Refusing sends the drag back.
-            guard !urls.contains(where: { $0.scheme == "iconery-set" }) else { return false }
+            guard GridDrop.accepts(urls) else { return false }
             return library.handleDrop(urls, onto: library.currentSetID)
-        } isTargeted: { isDropTarget = $0 }
+        } isTargeted: { targeted in
+            // The outline is for drags the drop will take; the drag's payload is read from its
+            // pasteboard because isTargeted only says that a drag is over the grid.
+            let carried = NSPasteboard(name: .drag).readObjects(forClasses: [NSURL.self]) as? [URL]
+            isDropTarget = targeted && GridDrop.accepts(carried ?? [])
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar(count: icons.count) }
     }
 
@@ -227,6 +226,18 @@ struct IconGridView: View {
         .padding(.vertical, 7)
         .background(.bar)
         .overlay(alignment: .top) { Divider() }
+    }
+}
+
+/// What the grid takes from a drop.
+enum GridDrop {
+    /// A drag that began in this grid and ends over it is a slipped drag, not a move: the grid
+    /// shows nested sets' icons too, and "move to the set being viewed" would quietly pull one
+    /// out of its set. A sidebar set released over it has no set under it: handleDrop would
+    /// nest it into the one being viewed. Moves and nesting go through the sidebar's rows.
+    /// A drag whose payload can't be read yet (empty) is not refused.
+    static func accepts(_ urls: [URL]) -> Bool {
+        !Library.isGridDrag(urls) && !urls.contains { $0.scheme == "iconery-set" }
     }
 }
 

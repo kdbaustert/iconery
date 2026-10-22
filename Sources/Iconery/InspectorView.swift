@@ -412,7 +412,7 @@ private struct ExportButton: View {
             Button("Save") { library.savePreset(named: presetName) }
                 .keyboardShortcut(.defaultAction)
         } message: {
-            Text("Keeps the current format, sizes, prefix and suffix under a name.")
+            Text("Keeps the current format and sizes under a name.")
         }
     }
 
@@ -640,8 +640,11 @@ struct TagField: NSViewRepresentable {
             // what was typed. The outside change is remembered and applied to what the field
             // holds when editing ends, so the commit carries only what the user changed.
             removedMeanwhile.formUnion(known.filter { !tags.contains($0) })
-            addedMeanwhile += tags.filter { !known.contains($0) }
-            removedMeanwhile.subtract(addedMeanwhile)
+            let added = tags.filter { !known.contains($0) }
+            // A tag added and then removed again while editing is gone, not re-added.
+            addedMeanwhile.removeAll { !tags.contains($0) }
+            addedMeanwhile += added
+            removedMeanwhile.subtract(added)
         }
 
         func controlTextDidEndEditing(_ notification: Notification) {
@@ -665,6 +668,9 @@ struct TagField: NSViewRepresentable {
             }
             let committed = kept + addedMeanwhile.filter { !kept.contains($0) }
             commit(committed)
+            // The model may find nothing changed and never call updateNSView, which would leave
+            // a removed token on show to be committed back at the next focus change.
+            field.objectValue = committed
             // The model is about to echo this back; it isn't an outside change.
             known = committed
             removedMeanwhile = []
@@ -709,7 +715,7 @@ private struct OpenInButton: View {
         // list for this file type; it still counts as long as it's installed.
         let rememberedApp = remembered.isEmpty ? nil : URL(filePath: remembered)
         let chosen = rememberedApp.flatMap {
-            FileManager.default.fileExists(atPath: $0.path(percentEncoded: false)) ? $0 : nil
+            Library.isUsableApp($0) ? $0 : nil
         } ?? NSWorkspace.shared.urlForApplication(toOpen: file)
         Menu {
             ForEach(apps, id: \.self) { app in

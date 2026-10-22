@@ -272,13 +272,24 @@ struct ExportPreset: Identifiable, Codable, Hashable {
 
     /// The user's own presets, kept app-wide like the rest of the export settings. Each is
     /// decoded on its own, so one this build can't read (a format a later version added) costs
-    /// only itself, not the rest.
+    /// only itself, not the rest. Older builds saved the form's prefix and suffix inside each
+    /// output; they are dropped here, because the form's own are applied on top and a preset
+    /// that kept them would write them twice.
     static func loadSaved() -> [ExportPreset] {
         stored().compactMap { try? JSONDecoder().decode(ExportPreset.self, from: $0.data) }
+            .map { preset in
+                var preset = preset
+                for index in preset.outputs.indices {
+                    preset.outputs[index].prefix = ""
+                    preset.outputs[index].suffix = ""
+                }
+                return preset
+            }
     }
 
-    /// Writes `presets` back with the stored entries this build can't decode left in place, so
-    /// a newer build's preset survives a round trip through this one.
+    /// Writes `presets` back with the stored entries this build can't decode as a whole left in
+    /// place, so a newer build's preset survives a round trip through this one. A preset it can
+    /// decode is rewritten from what it understood, so keys it doesn't know are not kept.
     static func save(_ presets: [ExportPreset]) {
         let unreadable = stored().filter {
             (try? JSONDecoder().decode(ExportPreset.self, from: $0.data)) == nil
@@ -545,38 +556,6 @@ enum Exporter {
         }
     }
 
-    /// The files a drag or copy carries for each of `items`, in the same order, drawn on every
-    /// core at once. A drag has to hand over real files before it can begin, so the work can't
-    /// be deferred, only spread out: 9,000 icons take about 3 s on one core, which stalled the
-    /// window at the moment the mouse moved.
-    ///
-    /// Nothing here touches the library. Each item gets an NSImage of its own, read from its file,
-    /// because an NSImage is safe on a thread only while that thread is its only user, and
-    /// NSGraphicsContext.current is per thread. That is also why the library's image cache stays
-    /// out of it. An icon that can't be drawn is carried as the file it came in as, so nothing
-    /// arrives empty; one whose file is gone comes back nil.
-    static func transferFiles(
-        _ items: [(icon: Icon, source: URL)], settings: [ExportOptions]
-    ) -> [[ExportFile]?] {
-        // Each slot is written once, by the iteration that owns it. The lock only makes that
-        // visible to the compiler and the other cores; it is held for one assignment.
-        let slots = OSAllocatedUnfairLock<[[ExportFile]?]>(
-            initialState: Array(repeating: nil, count: items.count)
-        )
-        DispatchQueue.concurrentPerform(iterations: items.count) { index in
-            let (icon, source) = items[index]
-            let image = NSImage(contentsOf: source)
-            let drawn = try? settings.flatMap {
-                try files(for: icon, source: source, image: image, options: $0)
-            }
-            let result = drawn ?? (try? Data(contentsOf: source)).map {
-                [ExportFile(name: "\(safeFileName(icon.name)).\(icon.kind.rawValue)", data: $0)]
-            }
-            slots.withLock { $0[index] = result }
-        }
-        return slots.withLock { $0 }
-    }
-
     /// A folder Xcode drags in whole: Contents.json beside the images. An SVG goes in as itself
     /// with its vector representation preserved; anything else as 1x/2x/3x PNGs of each picked
     /// size, through the same fill and background as a PNG export.
@@ -638,79 +617,224 @@ enum Exporter {
     /// inside a folder, like an image set's Contents.json: a clash renames at that folder, so
     /// its contents stay together. Returns what a caller should hand on — each loose file,
     /// and each such folder once in place of its contents, so a drag carries the image set
-    /// itself, Finder tags land on it, and Show in Finder selects it whole.
+    /// itself, Finder tags land on it, and Show in Finder selects it whole. If a write fails,
+    /// the folders this call made are removed again when they are left empty.
     @discardableResult
     static func write(_ files: [ExportFile], to folder: URL) throws -> [URL] {
-        var claimed: Set<URL> = []
-        let (jobs, written) = try plan(files, in: folder, claimed: &claimed)
-        for job in jobs { try job.data.write(to: job.url, options: .withoutOverwriting) }
+        var claimed: Set<String> = []
+        let (jobs, written, made) = try plan(files, in: folder, claimed: &claimed)
+        do {
+            for job in jobs { try job.data.write(to: job.url, options: .withoutOverwriting) }
+        } catch {
+            removeIfEmpty(made)
+            throw error
+        }
         return written
     }
 
-    /// `write` for many icons' files at once, one batch per icon, as a drag or copy produces
-    /// them. Every name is decided first, one batch after another, so a clash is renamed the way
-    /// it would have been writing the batches in turn; only then are the bytes written, on every
-    /// core. A batch that can't be written whole comes back empty, as a throwing `write` does
-    /// for the caller who skips it with `try?`.
-    static func write(batches: [[ExportFile]], to folder: URL) -> [[URL]] {
-        var claimed: Set<URL> = []
-        var jobs: [(batch: Int, url: URL, data: Data)] = []
-        var written: [[URL]] = []
-        for (batch, files) in batches.enumerated() {
-            guard let planned = try? plan(files, in: folder, claimed: &claimed) else {
-                written.append([])
-                continue
-            }
-            jobs += planned.jobs.map { (batch, $0.url, $0.data) }
-            written.append(planned.written)
-        }
-        let failed = OSAllocatedUnfairLock<Set<Int>>(initialState: [])
-        let planned = jobs
-        DispatchQueue.concurrentPerform(iterations: planned.count) { index in
-            let job = planned[index]
-            do {
-                try job.data.write(to: job.url, options: .withoutOverwriting)
-            } catch {
-                failed.withLock { _ = $0.insert(job.batch) }
-            }
-        }
-        for batch in failed.withLock({ $0 }) { written[batch] = [] }
-        return written
-    }
-
-    /// Decides where each of `files` goes and makes the folders they need, writing nothing.
-    /// `claimed` holds the names already decided for earlier files that aren't on disk yet.
-    private static func plan(
-        _ files: [ExportFile], in folder: URL, claimed: inout Set<URL>
-    ) throws -> (jobs: [(url: URL, data: Data)], written: [URL]) {
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        var renamed: [String: String] = [:]
-        var jobs: [(url: URL, data: Data)] = []
+    /// What a drag or copy staged: the files and folders to hand on, the icons whose own file
+    /// was gone, and an error for each icon that could not be written.
+    struct Transfer {
         var written: [URL] = []
-        for file in files {
-            let url: URL
-            if let slash = file.name.firstIndex(of: "/") {
-                let top = String(file.name[..<slash])
-                let rest = String(file.name[file.name.index(after: slash)...])
-                let unique = renamed[top]
-                    ?? uniqueURL(for: top, in: folder, avoiding: claimed).lastPathComponent
-                if renamed[top] == nil {
-                    renamed[top] = unique
-                    written.append(folder.appending(path: unique))
-                    claimed.insert(folder.appending(path: unique))
+        var missing: [String] = []
+        var failures: [(name: String, error: any Error)] = []
+    }
+
+    /// The files a drag or copy carries for each of `items`, written into `folder` the way
+    /// `write` would write them one icon after another, drawn and written on every core at once.
+    /// A drag has to hand over real files before it can begin, so the work can't be deferred,
+    /// only spread out: 9,000 icons take about 3 s on one core, which stalled the window at the
+    /// moment the mouse moved.
+    ///
+    /// Every name is decided first, one icon after another, from the names alone, so a clash is
+    /// renamed the same way whichever core finishes first. Each icon is then drawn and written
+    /// in one iteration, so its bytes are freed as soon as they are on disk instead of all being
+    /// held until the last icon is drawn.
+    ///
+    /// Nothing here touches the library. Each item gets an NSImage of its own, read from its file,
+    /// because an NSImage is safe on a thread only while that thread is its only user, and
+    /// NSGraphicsContext.current is per thread. That is also why the library's image cache stays
+    /// out of it. An icon that can't be drawn is carried as the file it came in as, so nothing
+    /// arrives empty; one whose file is gone is listed as missing. An icon that can't be written
+    /// whole is listed as a failure and leaves nothing behind.
+    static func transfer(
+        _ items: [(icon: Icon, source: URL)], settings: [ExportOptions], to folder: URL
+    ) -> Transfer {
+        var result = Transfer()
+        let present = items.filter {
+            if FileManager.default.fileExists(atPath: $0.source.path(percentEncoded: false)) {
+                return true
+            }
+            result.missing.append($0.icon.name)
+            return false
+        }
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        } catch {
+            result.failures = present.map { ($0.icon.name, error) }
+            return result
+        }
+        var claimed: Set<String> = []
+        // A folder is named with a trailing slash, as a file inside it would be.
+        let reservations = present.map { item in
+            reserve(
+                settings.flatMap { options in
+                    fileNames(for: item.icon, options: options).map {
+                        options.format == .imageset ? $0 + "/" : $0
+                    }
+                },
+                in: folder, claimed: &claimed
+            )
+        }
+
+        enum Outcome: Sendable {
+            case written, fellBack, failed(any Error)
+        }
+        // Each slot is written once, by the iteration that owns it. The lock only makes that
+        // visible to the compiler and the other cores; it is held for one assignment.
+        let outcomes = OSAllocatedUnfairLock<[Outcome]>(
+            initialState: Array(repeating: .fellBack, count: present.count)
+        )
+        DispatchQueue.concurrentPerform(iterations: present.count) { index in
+            let (icon, source) = present[index]
+            let image = NSImage(contentsOf: source)
+            let drawn = try? settings.flatMap {
+                try files(for: icon, source: source, image: image, options: $0)
+            }
+            let outcome: Outcome
+            if let drawn, let urls = urls(for: drawn.map(\.name), in: reservations[index]) {
+                outcome = writeAll(zip(drawn, urls), made: reservations[index].folders.values)
+                    .map { .failed($0) } ?? .written
+            } else {
+                outcome = .fellBack
+            }
+            outcomes.withLock { $0[index] = outcome }
+        }
+
+        let settled = zip(present, zip(outcomes.withLock { $0 }, reservations))
+        for (item, (outcome, reservation)) in settled {
+            switch outcome {
+            case .written:
+                result.written += reservation.written
+            case .failed(let error):
+                result.failures.append((item.icon.name, error))
+            case .fellBack:
+                // Serial and last: what is wrong with these icons is rare, and the names
+                // reserved for them were for files that never came.
+                removeIfEmpty(Array(reservation.folders.values))
+                guard let data = try? Data(contentsOf: item.source) else {
+                    result.missing.append(item.icon.name)
+                    continue
                 }
-                url = folder.appending(path: unique).appending(path: rest)
+                let name = "\(safeFileName(item.icon.name)).\(item.icon.kind.rawValue)"
+                let slot = reserve([name], in: folder, claimed: &claimed)
+                let file = (ExportFile(name: name, data: data), slot.loose[0])
+                if let error = writeAll([file], made: []) {
+                    result.failures.append((item.icon.name, error))
+                } else {
+                    result.written += slot.written
+                }
+            }
+        }
+        return result
+    }
+
+    /// Writes each file at its URL, making the folder it sits in. On the first failure it takes
+    /// back what it wrote, removes `made` if that leaves it empty, and returns the error.
+    private static func writeAll<S: Sequence>(
+        _ pairs: S, made: some Collection<URL>
+    ) -> (any Error)? where S.Element == (ExportFile, URL) {
+        var done: [URL] = []
+        do {
+            for (file, url) in pairs {
                 try FileManager.default.createDirectory(
                     at: url.deletingLastPathComponent(), withIntermediateDirectories: true
                 )
-            } else {
-                url = uniqueURL(for: file.name, in: folder, avoiding: claimed)
-                claimed.insert(url)
-                written.append(url)
+                try file.data.write(to: url, options: .withoutOverwriting)
+                done.append(url)
             }
-            jobs.append((url, file.data))
+            return nil
+        } catch {
+            for url in done { try? FileManager.default.removeItem(at: url) }
+            removeIfEmpty(Array(made))
+            return error
         }
-        return (jobs, written)
+    }
+
+    private static func removeIfEmpty(_ folders: [URL]) {
+        for folder in folders {
+            let inside = try? FileManager.default.contentsOfDirectory(atPath: folder.path)
+            if inside?.isEmpty == true { try? FileManager.default.removeItem(at: folder) }
+        }
+    }
+
+    /// The names decided for one icon's files before they exist: its loose files in order, and
+    /// where each folder went, keyed by the folder's name as the files asked for it.
+    private struct Reservation: Sendable {
+        var loose: [URL] = []
+        var folders: [String: URL] = [:]
+        var written: [URL] = []
+    }
+
+    /// Decides where each of `names` goes, writing and making nothing. `claimed` holds the
+    /// names already decided for earlier files that aren't on disk yet.
+    private static func reserve(
+        _ names: [String], in folder: URL, claimed: inout Set<String>
+    ) -> Reservation {
+        var reservation = Reservation()
+        for name in names {
+            let top = name.firstIndex(of: "/").map { String(name[..<$0]) }
+            if let top, reservation.folders[top] != nil { continue }
+            let url = uniqueURL(for: top ?? name, in: folder, avoiding: claimed)
+            claimed.insert(claimKey(url))
+            reservation.written.append(url)
+            if let top {
+                reservation.folders[top] = url
+            } else {
+                reservation.loose.append(url)
+            }
+        }
+        return reservation
+    }
+
+    /// Where each of `names` lands under `reservation`; nil if the files asked for more than
+    /// was reserved.
+    private static func urls(for names: [String], in reservation: Reservation) -> [URL]? {
+        var loose = reservation.loose.makeIterator()
+        var urls: [URL] = []
+        for name in names {
+            guard let slash = name.firstIndex(of: "/") else {
+                guard let url = loose.next() else { return nil }
+                urls.append(url)
+                continue
+            }
+            guard let folder = reservation.folders[String(name[..<slash])] else { return nil }
+            urls.append(folder.appending(path: String(name[name.index(after: slash)...])))
+        }
+        return urls
+    }
+
+    /// Decides where each of `files` goes and makes the folders they need, writing nothing. The
+    /// folders it made come back too, for taking away again if a write fails.
+    private static func plan(
+        _ files: [ExportFile], in folder: URL, claimed: inout Set<String>
+    ) throws -> (jobs: [(url: URL, data: Data)], written: [URL], made: [URL]) {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let reservation = reserve(files.map(\.name), in: folder, claimed: &claimed)
+        let made = Array(reservation.folders.values)
+        var jobs: [(url: URL, data: Data)] = []
+        do {
+            for (file, url) in zip(files, urls(for: files.map(\.name), in: reservation) ?? []) {
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+                )
+                jobs.append((url, file.data))
+            }
+        } catch {
+            removeIfEmpty(made)
+            throw error
+        }
+        return (jobs, reservation.written, made)
     }
 
     /// Finder's rule for a clash: "home.png" becomes "home 2.png", then "home 3.png".
@@ -718,11 +842,21 @@ enum Exporter {
         uniqueURL(for: name, in: folder, avoiding: [])
     }
 
+    /// A path as the claims compare it. The default volume ignores case and treats "é" typed
+    /// as one character or as e plus an accent as the same name, so "Home.png" and "home.png"
+    /// would otherwise both look free until one is on disk. Accents still tell names apart.
+    private static func claimKey(_ url: URL) -> String {
+        var path = url.path(percentEncoded: false)
+        if path.hasSuffix("/") { path.removeLast() }
+        return path.precomposedStringWithCanonicalMapping.lowercased()
+            .precomposedStringWithCanonicalMapping
+    }
+
     private static func uniqueURL(
-        for name: String, in folder: URL, avoiding claimed: Set<URL>
+        for name: String, in folder: URL, avoiding claimed: Set<String>
     ) -> URL {
         func taken(_ url: URL) -> Bool {
-            claimed.contains(url)
+            claimed.contains(claimKey(url))
                 || FileManager.default.fileExists(atPath: url.path(percentEncoded: false))
         }
         let first = folder.appending(path: name)

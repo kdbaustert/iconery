@@ -200,7 +200,12 @@ private struct LibrarySettings: View {
             GridRow {
                 settingsLabel("Backups")
                 VStack(alignment: .leading, spacing: 10) {
-                    PathControl(url: library.backupFolder)
+                    if library.isBackupFolderMissing {
+                        Text("The backup folder couldn't be found. Connect it or choose another.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        PathControl(url: library.backupFolder)
+                    }
                     HStack {
                         Button("Change Backup Location…", action: changeBackupFolder)
                         Button("Back Up Now", action: backUpNow)
@@ -260,6 +265,8 @@ private struct LibrarySettings: View {
     }
 
     private func switchLibrary() {
+        // An inspector edit not yet committed saves into this library before it is left.
+        AppDelegate.libraryWindow?.makeFirstResponder(nil)
         guard let folder = chooseFolder(
             prompt: "Switch",
             message: "Choose an Iconery library: a folder with library.json inside.",
