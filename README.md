@@ -10,6 +10,15 @@ IconJar library. Runs on macOS 14 and later.
 
 There are no release builds yet; see [Contributing](#contributing) to build it.
 
+<p align="center">
+  <img src="docs/screenshots/main-window.png" alt="Iconery's main window, with an icon selected and its export options in the sidebar" width="800">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/settings-general.png" alt="General settings: appearance, grid, search and deleting" width="395">
+  <img src="docs/screenshots/settings-export.png" alt="Export settings: file names, folders, export location and SVG cleanup" width="395">
+</p>
+
 ## Features
 
 ### Library
