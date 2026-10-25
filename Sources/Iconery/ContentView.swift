@@ -29,6 +29,7 @@ struct ContentView: View {
                         .help(showsInspector ? "Hide the inspector" : "Show the inspector")
                     }
                 }
+                .overlay(alignment: .top) { ToastView() }
                 .inspector(isPresented: $showsInspector) {
                     InspectorView()
                         .inspectorColumnWidth(min: 260, ideal: 290, max: 400)
@@ -78,6 +79,66 @@ struct ContentView: View {
             get: { library[keyPath: keyPath] != nil },
             set: { if !$0 { library[keyPath: keyPath] = nil } }
         )
+    }
+}
+
+/// The import, move or delete confirmation at the top of the grid, just under the toolbar where
+/// the eye already is: a glass capsule that drops in, with a coloured badge saying which. It fades after three seconds, and clicks pass through it
+/// to the icons beneath.
+private struct ToastView: View {
+    @Environment(Library.self) private var library
+
+    var body: some View {
+        ZStack {
+            if let toast = library.toast {
+                let (symbol, tint): (String, Color) = switch toast.kind {
+                case .done: ("checkmark", .green)
+                case .moved: ("folder.fill", .blue)
+                case .deleted: ("trash.fill", .red)
+                }
+                HStack(spacing: 10) {
+                    Image(systemName: symbol)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 26, height: 26)
+                        .background(tint.gradient, in: Circle())
+                        .accessibilityHidden(true)
+                    Text(toast.text)
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .padding(.leading, 6)
+                .padding(.trailing, 16)
+                .padding(.vertical, 6)
+                .modifier(GlassCapsule())
+                .shadow(color: .black.opacity(0.18), radius: 14, y: 6)
+                .padding(.top, 14)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .task(id: toast.id) {
+                        AccessibilityNotification.Announcement(toast.text).post()
+                        // A newer toast cancels this wait and starts its own three seconds.
+                        try? await Task.sleep(for: .seconds(3))
+                        guard !Task.isCancelled, library.toast == toast else { return }
+                        library.toast = nil
+                    }
+            }
+        }
+        .allowsHitTesting(false)
+        .animation(.spring(duration: 0.4, bounce: 0.25), value: library.toast)
+    }
+}
+
+/// Liquid Glass where the system has it, and the frosted material that came before it elsewhere.
+private struct GlassCapsule: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            content.glassEffect(.regular, in: .capsule)
+        } else {
+            content
+                .background(.regularMaterial, in: Capsule())
+                .overlay { Capsule().strokeBorder(.separator) }
+        }
     }
 }
 

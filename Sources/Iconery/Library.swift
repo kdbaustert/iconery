@@ -63,6 +63,9 @@ final class Library {
         }
     }
 
+    /// Confirms an import that needed no alert, a move or a delete. The grid shows it and clears it.
+    var toast: Toast?
+
     @ObservationIgnored private var anchor: UUID?
     /// The keyboard caret: the moving end of a ⇧-arrow range, where the anchor is the fixed one.
     @ObservationIgnored private var focusID: UUID?
@@ -901,6 +904,14 @@ final class Library {
     func perform(_ deletion: Deletion) {
         guard !refusesDeleteInTrash() else { return }
         let name = if case .set = deletion { "Delete Set" } else { "Delete" }
+        let countBefore = icons.count
+        defer {
+            // Counted from the library rather than the ids, which may name icons already gone.
+            if case .icons = deletion, icons.count < countBefore {
+                let deleted = "Deleted \(plural(countBefore - icons.count, "icon"))"
+                toast = Toast(text: deleted, kind: .deleted)
+            }
+        }
         recording(name) {
             switch deletion {
             case .set(let set, _, _):
@@ -1160,7 +1171,14 @@ final class Library {
     }
 
     func move(_ ids: Set<UUID>, to setID: UUID) {
+        // Icons already in that set don't count as moved.
+        let moving = icons.filter { ids.contains($0.id) && $0.setID != setID }.count
         recording("Move to Set") { update(ids) { $0.setID = setID } }
+        guard moving > 0 else { return }
+        // The full path, as the Move to Set menu shows it: "Outline" alone could be any of several.
+        let path = setPaths.first { $0.set.id == setID }?.path ?? title(for: .set(setID))
+        let moved = "Moved \(plural(moving, "icon")) to “\(path)”"
+        toast = Toast(text: moved, kind: .moved)
     }
 
     /// Whether the menu bar offers Unstar: only when every selected icon is starred.
@@ -1744,11 +1762,13 @@ final class Library {
             let skipped = Self.listed(report.skipped)
             lines.append("Skipped what isn't a readable SVG, PNG, ICNS or ICO:\n" + skipped)
         }
+        let imported = "Imported \(plural(report.imported, "icon"))"
         if !lines.isEmpty {
-            notice = Notice(
-                title: "Imported \(plural(report.imported, "icon"))",
-                message: lines.joined(separator: "\n\n")
-            )
+            notice = Notice(title: imported, message: lines.joined(separator: "\n\n"))
+        } else if report.imported > 0 {
+            // A drop onto a sidebar set lands somewhere other than the grid in view, so name it.
+            let into = target.map { " into “\(title(for: .set($0)))”" } ?? ""
+            toast = Toast(text: imported + into)
         }
         return report.imported > 0
     }
@@ -1798,9 +1818,7 @@ final class Library {
         // undoing the move would re-stamp the icons.
         let before = draggedLastUsed
         update(ids) { if let old = before[$0.id] { $0.lastUsed = old } }
-        recording("Move to Set") {
-            update(ids) { $0.setID = setID }
-        }
+        move(ids, to: setID)
         return true
     }
 

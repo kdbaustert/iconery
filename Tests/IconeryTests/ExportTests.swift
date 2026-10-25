@@ -924,6 +924,45 @@ final class ExportTests: XCTestCase {
         XCTAssertNotNil(library.pendingDeletion)
     }
 
+    @MainActor
+    func testDeletingIconsShowsAToastButDeletingASetDoesNot() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let set = library.createSet(named: "Set")
+        library.importItems(
+            [try writeSVG("a", #"<path d="M1 1h9"/>"#), try writeSVG("b", #"<path d="M2 2h9"/>"#)],
+            into: set.id
+        )
+
+        // A stale id from an icon already gone is not counted.
+        library.perform(.icons(Set(library.icons.map(\.id)).union([UUID()])))
+
+        XCTAssertEqual(library.toast?.text, "Deleted 2 icons")
+
+        library.toast = nil
+        library.importItems([try writeSVG("c", #"<path d="M3 3h9"/>"#)], into: set.id)
+        library.perform(.set(set, iconCount: 1, setCount: 0))
+
+        XCTAssertNil(library.toast)
+    }
+
+    @MainActor
+    func testMovingIconsShowsAToastCountingOnlyThoseThatMoved() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let from = library.createSet(named: "From")
+        let to = library.createSet(named: "Arrows", inside: library.createSet(named: "Lucide").id)
+        library.importItems([try writeSVG("a", #"<path d="M1 1h9"/>"#)], into: from.id)
+        library.importItems([try writeSVG("b", #"<path d="M2 2h9"/>"#)], into: to.id)
+
+        library.move(Set(library.icons.map(\.id)), to: to.id)
+
+        XCTAssertEqual(library.toast?.text, "Moved 1 icon to “Lucide › Arrows”")
+
+        library.toast = nil
+        library.move(Set(library.icons.map(\.id)), to: to.id)
+
+        XCTAssertNil(library.toast, "nothing moved")
+    }
+
     func testSVGCleanupChangesOnlyWhatIsAskedFor() {
         let svg = """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -3230,6 +3269,24 @@ final class ExportTests: XCTestCase {
         XCTAssertTrue(library.icons.isEmpty)
         XCTAssertEqual(library.notice?.title, "“Unpacked” is an Iconery library")
         XCTAssertTrue(library.notice?.message.contains("Switch") == true)
+    }
+
+    @MainActor
+    func testACleanImportShowsAToastAndAnUntidyOneAnAlert() throws {
+        let library = Library(folder: folder.appending(path: "Library"), preferences: preferences())
+        let set = library.createSet(named: "Arrows")
+        let first = try writeSVG("a", #"<path d="M1 1h4"/>"#)
+
+        library.importAndReport([first, try writeSVG("b", #"<path d="M2 1h4"/>"#)], into: set.id)
+
+        XCTAssertEqual(library.toast?.text, "Imported 2 icons into “Arrows”")
+        XCTAssertNil(library.notice)
+
+        library.toast = nil
+        library.importAndReport([first, try writeSVG("c", #"<path d="M3 1h4"/>"#)], into: nil)
+
+        XCTAssertNil(library.toast, "the alert already says it")
+        XCTAssertEqual(library.notice?.title, "Imported 1 icon")
     }
 
     @MainActor

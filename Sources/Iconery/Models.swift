@@ -233,6 +233,16 @@ struct Notice {
     var message: String
 }
 
+/// A passing message that fades on its own. The id lets the same text shown twice in a row
+/// restart its timer.
+struct Toast: Equatable {
+    enum Kind { case done, moved, deleted }
+
+    let id = UUID()
+    var text: String
+    var kind = Kind.done
+}
+
 func plural(_ count: Int, _ noun: String, _ many: String? = nil) -> String {
     "\(count) \(count == 1 ? noun : many ?? noun + "s")"
 }
