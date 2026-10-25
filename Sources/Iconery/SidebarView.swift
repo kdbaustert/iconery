@@ -124,7 +124,9 @@ private struct SetRow: View {
                         .padding(-3)
                 }
             }
-            .draggable(Library.setDragURL(set.id))
+            // itemProvider rides the List's own row drag; .draggable claims the mouse-down
+            // and a click no longer selects the set.
+            .itemProvider { NSItemProvider(object: Library.setDragURL(set.id) as NSURL) }
             .dropDestination(for: URL.self) { urls, _ in
                 library.handleDrop(urls, onto: set.id)
             } isTargeted: { isTargeted = $0 }
